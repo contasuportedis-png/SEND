@@ -18,24 +18,52 @@ send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos
 
 ## 📦 Instalação
 
-### Linux / Pop!_OS / Ubuntu
+### Opção 1 — Git clone (recomendada: o código fica no seu PC)
 
 ```bash
-curl -fsSL https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.sh | bash
+git clone https://github.com/contasuportedis-png/SEND.git
+cd SEND
+make install            # instala em ~/.local/bin/send (Linux/macOS)
+# ou, para todos os usuários do PC:
+# sudo make install-system
 ```
 
-Isso instala em `~/.local/bin/send` (adicione ao PATH se for preciso), baixa o
-script, e deixa tudo pronto. Depois:
+Sem `make`? É só copiar o arquivo (funciona em qualquer sistema):
+
+```bash
+mkdir -p ~/.local/bin
+cp send.py ~/.local/bin/send
+chmod +x ~/.local/bin/send
+```
+
+Confira que `~/.local/bin` está no seu PATH (Pop!_OS / Ubuntu):
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Pronto:
 
 ```bash
 send --doctor     # testa a conexão com o LM Studio
 send              # abre o assistente
 ```
 
-### Windows (PowerShell)
+> Para atualizar depois do clone: `cd SEND && git pull && make install`
+
+### Opção 2 — Comando único (sem clonar)
+
+**Linux / Pop!_OS / Ubuntu:**
+
+```bash
+curl -fsSL https://github.com/contasuportedis-png/SEND/raw/main/install.sh | bash
+```
+
+**Windows (PowerShell):**
 
 ```powershell
-irm https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.ps1 | iex
+irm https://github.com/contasuportedis-png/SEND/raw/main/install.ps1 | iex
 ```
 
 Instala em `%USERPROFILE%\.send\` e cria o comando `send` (adicione ao PATH se

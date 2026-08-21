@@ -13,7 +13,7 @@ set -euo pipefail
 
 SEND_VERSION="${SEND_VERSION:-latest}"
 BASE_URL="https://github.com/contasuportedis-png/SEND/releases/${SEND_VERSION}/download"
-FALLBACK_URL="https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/send.py"
+FALLBACK_URL="https://github.com/contasuportedis-png/SEND/raw/main/send.py"
 
 echo "⚡ SEND — instalador"
 
@@ -32,11 +32,17 @@ else
 fi
 mkdir -p "$(dirname "$DEST")"
 
-# 3) Download (release oficial com fallback para o repositório)
-echo "⬇ Baixando SEND ${SEND_VERSION} ..."
-if ! curl -fsSL "${BASE_URL}/send.py" -o "${DEST}.tmp" 2>/dev/null; then
-  echo "  (usando fallback do repositório)"
-  curl -fsSL "${FALLBACK_URL}" -o "${DEST}.tmp"
+# 3) Origem do arquivo: se estiver rodando dentro do clone (send.py ao lado),
+#    instala o arquivo local; senão baixa do repositório.
+if [[ -f "$(dirname "$0")/send.py" ]]; then
+  echo "📁 Usando o send.py do clone local"
+  cp "$(dirname "$0")/send.py" "${DEST}.tmp"
+else
+  echo "⬇ Baixando SEND ${SEND_VERSION} ..."
+  if ! curl -fsSL "${BASE_URL}/send.py" -o "${DEST}.tmp" 2>/dev/null; then
+    echo "  (usando fallback do repositório)"
+    curl -fsSL "${FALLBACK_URL}" -o "${DEST}.tmp"
+  fi
 fi
 
 # 4) Sanidade: deve ser um script Python
