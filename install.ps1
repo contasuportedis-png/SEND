@@ -26,7 +26,7 @@ $SendCmd = Join-Path $Dest "send.cmd"
 
 # 3) Download (release oficial com fallback para o repositório)
 $url  = "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
-$fallback = "https://raw.githubusercontent.com/contasuportedis-png/SEND/arena/01a0252e-send/send.py"
+$fallback = "https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/send.py"
 Write-Host "⬇ Baixando SEND..."
 try {
     Invoke-WebRequest -Uri $url -OutFile $SendPy -UseBasicParsing

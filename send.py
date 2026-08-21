@@ -49,7 +49,7 @@ DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
 )
 RAW_FALLBACK_URL = (
-    "https://raw.githubusercontent.com/contasuportedis-png/SEND/"
+    "https://github.com/contasuportedis-png/SEND/raw/"
     "arena/01a0252e-send/send.py"
 )
 
@@ -997,10 +997,10 @@ INSTALL_HINT = """\
 Para instalar o SEND em outra máquina:
 
   Linux / macOS (Pop!_OS, Ubuntu, etc.):
-    curl -fsSL https://github.com/contasuportedis-png/SEND/releases/latest/download/install.sh | bash
+    curl -fsSL https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.sh | bash
 
   Windows (PowerShell):
-    irm https://github.com/contasuportedis-png/SEND/releases/latest/download/install.ps1 | iex
+    irm https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.ps1 | iex
 
 Depois: abra o LM Studio, carregue um modelo, inicie o servidor (porta 1234)
 e rode:  send --doctor

@@ -21,7 +21,7 @@ send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos
 ### Linux / Pop!_OS / Ubuntu
 
 ```bash
-curl -fsSL https://github.com/contasuportedis-png/SEND/releases/latest/download/install.sh | bash
+curl -fsSL https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.sh | bash
 ```
 
 Isso instala em `~/.local/bin/send` (adicione ao PATH se for preciso), baixa o
@@ -35,11 +35,14 @@ send              # abre o assistente
 ### Windows (PowerShell)
 
 ```powershell
-irm https://github.com/contasuportedis-png/SEND/releases/latest/download/install.ps1 | iex
+irm https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/install.ps1 | iex
 ```
 
 Instala em `%USERPROFILE%\.send\` e cria o comando `send` (adicione ao PATH se
 pedir). Abra um **novo terminal** e use `send --doctor` e depois `send`.
+
+> Os mesmos arquivos (`send.py`, `install.sh`, `install.ps1`) também estão
+> disponíveis na página de [Releases](https://github.com/contasuportedis-png/SEND/releases).
 
 > Pré-requisito (os dois sistemas): **Python 3** instalado e o **LM Studio**
 > com o servidor local ligado.

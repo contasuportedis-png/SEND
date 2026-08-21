@@ -13,7 +13,7 @@ set -euo pipefail
 
 SEND_VERSION="${SEND_VERSION:-latest}"
 BASE_URL="https://github.com/contasuportedis-png/SEND/releases/${SEND_VERSION}/download"
-FALLBACK_URL="https://raw.githubusercontent.com/contasuportedis-png/SEND/arena/01a0252e-send/send.py"
+FALLBACK_URL="https://github.com/contasuportedis-png/SEND/raw/arena/01a0252e-send/send.py"
 
 echo "⚡ SEND — instalador"
 
