@@ -50,7 +50,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
@@ -111,13 +111,14 @@ DEFAULT_CONFIG = {
     "base_url": DEFAULT_BASE_URL,
     "api_key": "",
     "model": None,                 # None = detecta o primeiro modelo do LM Studio
-    "mode": "coding",              # chat | coding | plan
+    "mode": "coding",              # chat | coding | plan | workflow
     "thinking": False,
     "reasoning_effort": "medium",  # low | medium | high
     "show_reasoning": True,
     "auto_confirm": False,         # -y
     "temperature": 0.7,
-    "skills": ["arquivos", "terminal", "internet", "pc"],
+    "skills": ["arquivos", "terminal", "internet", "pc",
+               "git", "processos", "memoria"],
 }
 
 # ---------------------------------------------------------------------------
@@ -129,9 +130,18 @@ SKILLS = {
     "terminal": "executar comandos no terminal",
     "internet": "pesquisar na web e ler o conteúdo de páginas",
     "pc": "abrir arquivos/links no sistema e ver informações do PC",
+    "git": "operar repositórios git (status, diff, log, commit)",
+    "processos": "listar e encerrar processos do sistema",
+    "memoria": "aprender com o tempo: lembrar informações, ver a memória "
+               "de longo prazo e criar novas skills para o futuro",
 }
 
-SKILL_ORDER = ["arquivos", "terminal", "internet", "pc"]
+SKILL_ORDER = ["arquivos", "terminal", "internet", "pc",
+               "git", "processos", "memoria"]
+
+# Memória de longo prazo (aprendizado) e skills personalizadas
+MEMORY_PATH = SEND_HOME / "memoria.md"
+SKILLS_DIR = SEND_HOME / "skills"
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 "
               "Firefox/126.0")
@@ -149,6 +159,105 @@ IGNORED_DIRS = {
     ".tox", ".nox", ".nuxt", ".output", ".parcel-cache", ".svelte-kit",
     ".turbo", ".vite", ".idea", ".vscode",
 }
+
+MEMORY_PROMPT_HINT = (
+    " Você tem uma memória de longo prazo em ~/.send/memoria.md. Sempre que "
+    "aprender algo útil (preferências do usuário, decisões do projeto, bugs "
+    "corrigidos, comandos importantes), registre com a ferramenta 'remember'. "
+    "Você pode criar novas skills para o futuro com a ferramenta 'create_skill'."
+)
+
+
+def memory_summary(limit=1800):
+    """Retorna um resumo da memória de longo prazo (ou '' se vazia)."""
+    try:
+        if not MEMORY_PATH.exists():
+            return ""
+        text = MEMORY_PATH.read_text(encoding="utf-8").strip()
+        if not text:
+            return ""
+        if len(text) > limit:
+            text = text[:limit].rsplit("\n", 1)[0] + "\n… (memória truncada)"
+        return text
+    except Exception:
+        return ""
+
+
+def remember_entry(content):
+    """Grava uma entrada com data na memória de longo prazo."""
+    try:
+        SEND_HOME.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y-%m-%d %H:%M")
+        entry = f"\n## {ts}\n- {content.strip()}\n"
+        with open(MEMORY_PATH, "a", encoding="utf-8") as f:
+            f.write(entry)
+        return True
+    except Exception:
+        return False
+
+
+def load_custom_skills():
+    """Lê as skills personalizadas criadas pelo modelo (~/.send/skills/*.md).
+
+    Cada arquivo .md tem o formato:
+        # Skill: <nome>
+        Descrição: <frase curta sobre o que ela faz>
+        ## Instruções
+        <corpo com as instruções que o modelo deve seguir>
+    """
+    out = []
+    try:
+        if not SKILLS_DIR.exists():
+            return out
+        for f in sorted(SKILLS_DIR.glob("*.md")):
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            name = f.stem.strip().lower()
+            if not name:
+                continue
+            m = re.search(r"(?im)^\s*descri(?:ção|cao)\s*:\s*(.+)$", text)
+            desc = m.group(1).strip() if m else "(sem descrição)"
+            out.append({"name": name, "description": desc, "instructions": text})
+    except Exception:
+        pass
+    return out
+
+
+def custom_skill_tool(cs):
+    """Converte uma skill personalizada em uma ferramenta para a API."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "skill_" + cs["name"],
+            "description": ("Skill personalizada '" + cs["name"] + "': "
+                            + cs["description"] + " Siga as instruções da skill "
+                            "para executar a tarefa."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tarefa": {
+                        "type": "string",
+                        "description": "O que você quer que a skill execute.",
+                    }
+                },
+                "required": ["tarefa"],
+            },
+        },
+        "skill": cs["name"],
+    }
+
+
+def get_tools(cfg):
+    """Ferramentas da API filtrando pelas skills ativas + skills criadas."""
+    enabled = set(cfg.get("skills", []))
+    tools = [t for t in TOOLS if t.get("skill") in enabled]
+    for cs in load_custom_skills():
+        if cs["name"] in enabled:
+            tools.append(custom_skill_tool(cs))
+    return tools
+
 
 
 def load_config():
@@ -268,13 +377,63 @@ PLAN_SYSTEM = (
     "usuário quer que você execute o plano."
 )
 
+WORKFLOW_PLAN_SYSTEM = (
+    " Você está na ETAPA 1 (PLANEJAR) de um fluxo de trabalho em 4 etapas: "
+    "Planejar → Construir → Verificar → Corrigir. NÃO use ferramentas e NÃO "
+    "edite nada ainda. Produza um plano numerado em etapas (1., 2., 3. …) com "
+    "objetivo, arquivos afetados e ordem de execução. Se a tarefa for muito "
+    "grande (mais de 4 etapas), divida-a em FASES com marcos claros."
+)
+
+WORKFLOW_BUILD_SYSTEM = (
+    " Você está na ETAPA 2 (CONSTRUIR) do fluxo Planejar → Construir → "
+    "Verificar → Corrigir. Execute o plano aprovado passo a passo usando as "
+    "ferramentas disponíveis (ler/escrever/editar arquivos, executar comandos "
+    "etc.). Não pule etapas."
+)
+
+WORKFLOW_VERIFY_SYSTEM = (
+    " Você está na ETAPA 3 (VERIFICAR) do fluxo Planejar → Construir → "
+    "Verificar → Corrigir. Confira se o que foi construído está correto e "
+    "funcionando: rode testes/verificações, leia os arquivos criados, confira "
+    "se nada está quebrado. Comece sua resposta exatamente com "
+    "'VERIFICAÇÃO OK' (se estiver tudo certo) ou 'PROBLEMAS:' (listando cada "
+    "problema encontrado)."
+)
+
+WORKFLOW_FIX_SYSTEM = (
+    " Você está na ETAPA 4 (CORRIGIR) do fluxo Planejar → Construir → "
+    "Verificar → Corrigir. Corrija TODOS os problemas apontados na verificação "
+    "usando as ferramentas disponíveis. Depois a verificação será repetida."
+)
+
 
 def system_prompt(cfg, extra=""):
     parts = [BASE_SYSTEM]
-    if cfg["mode"] == "coding":
+    mode = cfg.get("mode", "coding")
+    if mode == "coding":
         parts.append(CODING_SYSTEM)
-    elif cfg["mode"] == "plan":
+    elif mode == "plan":
         parts.append(PLAN_SYSTEM)
+    elif mode == "workflow":
+        parts.append(
+            " Você está em MODO WORKFLOW: cada tarefa passa pelas 4 etapas "
+            "Planejar → Construir → Verificar → Corrigir."
+        )
+    elif mode == "workflow_plan":
+        parts.append(WORKFLOW_PLAN_SYSTEM)
+    elif mode == "workflow_build":
+        parts.append(WORKFLOW_BUILD_SYSTEM)
+    elif mode == "workflow_verify":
+        parts.append(WORKFLOW_VERIFY_SYSTEM)
+    elif mode == "workflow_fix":
+        parts.append(WORKFLOW_FIX_SYSTEM)
+    mem = memory_summary()
+    if mem:
+        parts.append(
+            "\n\n## Memória de longo prazo (aprendizado acumulado)\n" + mem
+        )
+        parts.append(MEMORY_PROMPT_HINT)
     if extra:
         parts.append(" Instrução adicional do usuário: " + extra)
     return "".join(parts)
@@ -523,6 +682,200 @@ TOOLS = [
         },
         "skill": "pc",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": "Mostra o estado do repositório git: branch atual e "
+                           "arquivos modificados/não rastreados.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Pasta do repositório (padrão: atual).",
+                    }
+                },
+            },
+        },
+        "skill": "git",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "Mostra o histórico de commits do repositório.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Pasta do repositório (padrão: atual).",
+                    },
+                    "n": {
+                        "type": "number",
+                        "description": "Quantos commits (padrão 10).",
+                    },
+                },
+            },
+        },
+        "skill": "git",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": "Mostra as diferenças pendentes do repositório "
+                           "(modificações não commitadas).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Pasta do repositório (padrão: atual).",
+                    }
+                },
+            },
+        },
+        "skill": "git",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_commit",
+            "description": "Faz git add -A e cria um commit com a mensagem "
+                           "informada.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "Mensagem do commit.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Pasta do repositório (padrão: atual).",
+                    },
+                },
+                "required": ["message"],
+            },
+        },
+        "skill": "git",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_processes",
+            "description": "Lista os processos do sistema (os mais pesados) com "
+                           "PID e uso de CPU/memória. Aceita um filtro opcional.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filter": {
+                        "type": "string",
+                        "description": "Filtro opcional por nome (ex.: python).",
+                    },
+                    "n": {
+                        "type": "number",
+                        "description": "Quantos processos (padrão 15).",
+                    },
+                },
+            },
+        },
+        "skill": "processos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kill_process",
+            "description": "Encerra um processo pelo PID ou pelo nome.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pid": {
+                        "type": "number",
+                        "description": "PID do processo a encerrar.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Nome do processo a encerrar (ex.: "
+                                       "notepad).",
+                    },
+                },
+            },
+        },
+        "skill": "processos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_memory",
+            "description": "Lê a memória de longo prazo do SEND (aprendizado "
+                           "acumulado em ~/.send/memoria.md).",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        "skill": "memoria",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Grava algo na memória de longo prazo do SEND. Use "
+                           "quando aprender algo útil: preferências do usuário, "
+                           "decisões do projeto, bugs corrigidos, comandos "
+                           "importantes. O conteúdo fica salvo em "
+                           "~/.send/memoria.md e é lembrado nas próximas "
+                           "sessões.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "O que você quer lembrar.",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+        "skill": "memoria",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "CRIA UMA NOVA SKILL personalizada para o futuro. "
+                           "Salva um arquivo .md em ~/.send/skills/ e ativa a "
+                           "skill. Use quando o usuário pedir algo repetitivo "
+                           "ou uma habilidade nova (ex.: 'crie uma skill para "
+                           "formatar código', 'crie uma skill que gera "
+                           "relatórios'). A skill ficará disponível como "
+                           "ferramenta nas próximas conversas.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nome curto da skill (letras minúsculas, "
+                                       "números e _).",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Frase curta: o que a skill faz.",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Instruções detalhadas que o modelo deve "
+                                       "seguir ao executar a skill.",
+                    },
+                },
+                "required": ["name", "description", "instructions"],
+            },
+        },
+        "skill": "memoria",
+    },
 ]
 
 def ask_yes_no(c, question, default=False):
@@ -611,7 +964,7 @@ def tool_run(args, c):
     return f"{tail}\n{out}" if out else f"{tail} (sem saída)"
 
 
-def execute_tool(name, args, c, auto_confirm):
+def execute_tool(name, args, c, auto_confirm, cfg=None):
     try:
         if name == "read_file":
             return tool_read(args, c)
@@ -645,6 +998,33 @@ def execute_tool(name, args, c, auto_confirm):
             return tool_open_file(args, c)
         if name == "open_url":
             return tool_open_url(args, c)
+        if name == "git_status":
+            return tool_git_status(args, c)
+        if name == "git_log":
+            return tool_git_log(args, c)
+        if name == "git_diff":
+            return tool_git_diff(args, c)
+        if name == "git_commit":
+            if not auto_confirm:
+                if not ask_yes_no(c, f"Criar commit: '{args.get('message', '')[:60]}'?"):
+                    return None
+            return tool_git_commit(args, c)
+        if name == "list_processes":
+            return tool_list_processes(args, c)
+        if name == "kill_process":
+            if not auto_confirm:
+                alvo = args.get("pid") or args.get("name") or "?"
+                if not ask_yes_no(c, f"Encerrar processo '{alvo}'?"):
+                    return None
+            return tool_kill_process(args, c)
+        if name == "read_memory":
+            return tool_read_memory(args, c)
+        if name == "remember":
+            return tool_remember(args, c)
+        if name == "create_skill":
+            return tool_create_skill(args, c, cfg)
+        if name.startswith("skill_"):
+            return tool_custom_skill(name, args, c, cfg)
         return f"Ferramenta desconhecida: {name}"
     except Exception as e:
         return f"Erro ao executar {name}: {e}"
@@ -896,6 +1276,206 @@ def tool_open_url(args, c):
         return f"Erro ao abrir o navegador: {e}"
 
 
+# --- Skill: git -------------------------------------------------------------
+
+def _git_cmd(args, *cmd, timeout=60):
+    p = _resolve_path(args.get("path", "."))
+    proc = subprocess.run(
+        ["git", *cmd], cwd=str(p), capture_output=True,
+        text=True, timeout=timeout,
+    )
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return f"(git {cmd[0] if cmd else ''} falhou: {err or 'erro desconhecido'})"
+    return out
+
+
+def tool_git_status(args, c):
+    branch = _git_cmd(args, "branch", "--show-current")
+    status = _git_cmd(args, "status", "--short")
+    if status.startswith("(git branch falhou") or not status:
+        full = _git_cmd(args, "status")
+        return f"Branch: {branch}\n\n{full}" if full else "Não é um repositório git."
+    return f"Branch: {branch}\n\n{status or '(working tree limpo)'}"
+
+
+def tool_git_log(args, c):
+    try:
+        n = int(args.get("n") or 10)
+    except (TypeError, ValueError):
+        n = 10
+    n = max(1, min(n, 100))
+    out = _git_cmd(args, "log", "--oneline", f"-n{n}")
+    return out or "(sem commits ainda)"
+
+
+def tool_git_diff(args, c):
+    stat = _git_cmd(args, "diff", "--stat")
+    diff = _git_cmd(args, "diff")
+    if not diff:
+        return "(nenhuma modificação pendente)"
+    body = diff[:TOOL_OUTPUT_LIMIT]
+    if len(diff) > TOOL_OUTPUT_LIMIT:
+        body += "\n… (diff truncado)"
+    return f"{stat}\n\n{body}"
+
+
+def tool_git_commit(args, c):
+    msg = args.get("message", "").strip()
+    if not msg:
+        return "Erro: mensagem do commit vazia."
+    add = _git_cmd(args, "add", "-A")
+    if add.startswith("(git"):
+        return add
+    out = _git_cmd(args, "commit", "-m", msg)
+    return out or "Commit criado."
+
+
+# --- Skill: processos -------------------------------------------------------
+
+def tool_list_processes(args, c):
+    filtro = args.get("filter", "").strip().lower()
+    try:
+        n = int(args.get("n") or 15)
+    except (TypeError, ValueError):
+        n = 15
+    n = max(1, min(n, 50))
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FO", "TABLE"],
+                             capture_output=True, text=True).stdout
+        lines = out.splitlines()
+    else:
+        out = subprocess.run(
+            ["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"],
+            capture_output=True, text=True,
+        ).stdout
+        lines = out.splitlines()
+    header = lines[:1]
+    rows = []
+    for ln in lines[1:]:
+        if not ln.strip():
+            continue
+        if filtro and filtro not in ln.lower():
+            continue
+        rows.append(ln)
+        if len(rows) >= n:
+            break
+    if not rows:
+        return f"Nenhum processo encontrado{f' com filtro {filtro!r}' if filtro else ''}."
+    return "\n".join(header + rows)
+
+
+def tool_kill_process(args, c):
+    pid = args.get("pid")
+    name = args.get("name", "").strip()
+    if not pid and not name:
+        return "Erro: informe pid ou name."
+    try:
+        if os.name == "nt":
+            if pid:
+                r = subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                   capture_output=True, text=True)
+            else:
+                r = subprocess.run(["taskkill", "/F", "/IM", name],
+                                   capture_output=True, text=True)
+        else:
+            if pid:
+                r = subprocess.run(["kill", "-9", str(pid)],
+                                   capture_output=True, text=True)
+            else:
+                r = subprocess.run(["pkill", "-9", "-f", name],
+                                   capture_output=True, text=True)
+        out = (r.stdout or "").strip() or (r.stderr or "").strip()
+        if r.returncode != 0:
+            return f"Falha ao encerrar: {out or 'erro'}"
+        return f"✅ Processo encerrado: {pid or name}"
+    except Exception as e:
+        return f"Erro ao encerrar processo: {e}"
+
+
+# --- Skill: memoria ---------------------------------------------------------
+
+def tool_read_memory(args, c):
+    text = memory_summary(limit=8000)
+    if not text:
+        return ("A memória de longo prazo está vazia. Use a ferramenta "
+                "'remember' para registrar o que aprender.")
+    return f"Memória de longo prazo ({MEMORY_PATH}):\n\n{text}"
+
+
+def tool_remember(args, c):
+    content = args.get("content", "").strip()
+    if not content:
+        return "Erro: conteúdo vazio."
+    if remember_entry(content):
+        return f"✅ Lembrei: {content}"
+    return f"Erro: não foi possível gravar em {MEMORY_PATH}"
+
+
+def tool_create_skill(args, c, cfg=None):
+    name = re.sub(r"[^a-z0-9_]+", "_",
+                  args.get("name", "").strip().lower()).strip("_")
+    if not name:
+        return "Erro: nome inválido (use letras minúsculas, números e _)."
+    if name in SKILLS:
+        return f"Erro: '{name}' já é uma skill nativa do SEND."
+    desc = args.get("description", "").strip() or "(sem descrição)"
+    instr = args.get("instructions", "").strip()
+    if not instr:
+        return "Erro: instruções vazias. Explique o que a skill deve fazer."
+    try:
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+        path = SKILLS_DIR / f"{name}.md"
+        if path.exists():
+            return (f"Erro: já existe uma skill '{name}' em {path}. "
+                    f"Use outro nome ou edite o arquivo.")
+        path.write_text(
+            f"# Skill: {name}\n\nDescrição: {desc}\n\n## Instruções\n\n{instr}\n",
+            encoding="utf-8",
+        )
+    except Exception as e:
+        return f"Erro ao criar a skill: {e}"
+    # ativa automaticamente
+    if cfg is not None:
+        skills = list(cfg.get("skills", []))
+        if name not in skills:
+            skills.append(name)
+            cfg["skills"] = skills
+            save_config(cfg)
+    return (f"✅ Skill '{name}' criada em {path} e ativada!\n"
+            f"Descrição: {desc}\n"
+            f"Da próxima vez, ela estará disponível como ferramenta "
+            f"'skill_{name}' nas conversas.")
+
+
+def tool_custom_skill(name, args, c, cfg=None):
+    """Executa uma skill personalizada: roda um sub-agente com as instruções
+    da skill como sistema, sem ferramentas."""
+    cs = next((s for s in load_custom_skills()
+               if "skill_" + s["name"] == name), None)
+    if not cs:
+        return f"Skill '{name}' não encontrada. Use create_skill para criá-la."
+    tarefa = args.get("tarefa", "")
+    if not tarefa:
+        return "Erro: tarefa vazia."
+    print(c.dim(f"    ⚡ executando skill '{cs['name']}'…"))
+    sub_cfg = dict(cfg or DEFAULT_CONFIG)
+    sub = Session(sub_cfg, c)
+    sub.extra_system = (
+        f"Você está executando a skill personalizada '{cs['name']}' "
+        f"({cs['description']}). Siga rigorosamente as instruções abaixo.\n\n"
+        f"{cs['instructions']}"
+    )
+    sub.messages = [{"role": "user",
+                     "content": "Tarefa para a skill: " + tarefa}]
+    try:
+        content = ask_model(sub, False, c, False)
+    except Exception as e:
+        return f"Erro ao executar a skill: {e}"
+    return f"[skill:{cs['name']}]\n{content or '(sem resposta)'}"
+
+
 def compact_args(args):
     s = json.dumps(args, ensure_ascii=False)
     return s if len(s) <= 100 else s[:97] + "..."
@@ -917,7 +1497,9 @@ def call_model(sess, tools_enabled, c, cfg):
     """Chama a API com streaming. Retorna (conteúdo, lista de tool_calls)."""
     if sess.model_id is None:
         sess.model_id = resolve_model(cfg, c)
-    messages = [{"role": "system", "content": system_prompt(cfg)}] + sess.messages
+    extra = getattr(sess, "extra_system", "")
+    messages = [{"role": "system",
+                 "content": system_prompt(cfg, extra)}] + sess.messages
     payload = {
         "model": sess.model_id,
         "messages": messages,
@@ -925,8 +1507,7 @@ def call_model(sess, tools_enabled, c, cfg):
         "temperature": cfg["temperature"],
     }
     if tools_enabled:
-        payload["tools"] = [t for t in TOOLS
-                            if t.get("skill") in cfg.get("skills", SKILL_ORDER)]
+        payload["tools"] = get_tools(cfg)
         payload["tool_choice"] = "auto"
     if cfg["thinking"]:
         payload["reasoning_effort"] = cfg["reasoning_effort"]
@@ -1041,7 +1622,7 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
             except Exception:
                 args = {"_raw": raw}
             print(c.yellow(f"  🔧 {name} {compact_args(args)}"))
-            result = execute_tool(name, args, c, auto_confirm)
+            result = execute_tool(name, args, c, auto_confirm, sess.cfg)
             if result is None:
                 result = (
                     "O usuário recusou executar esta ferramenta. "
@@ -1067,6 +1648,141 @@ def ask_model(sess, tools_enabled, c, auto_confirm):
             ))
             return run_agent(sess, False, c, auto_confirm)
         raise
+
+
+# ---------------------------------------------------------------------------
+# Workflow: Planejar → Construir → Verificar → Corrigir
+# ---------------------------------------------------------------------------
+
+WORKFLOW_MAX_FIX_CYCLES = 3
+
+
+def _count_plan_steps(plan):
+    return len(re.findall(r"(?m)^\s*(?:etapa|passo|step|fase)?\s*\d+[\.\):]",
+                          plan or ""))
+
+
+def run_workflow(sess, task, c, cfg):
+    """Executa uma tarefa no fluxo de 4 etapas:
+    1. PLANEJAR  — plano em etapas (divide tarefas grandes em fases)
+    2. CONSTRUIR — executa o plano com as ferramentas
+    3. VERIFICAR — confere se está tudo funcionando
+    4. CORRIGIR  — corrige o que não estiver certo (e reverifica, até 3x)
+    """
+    auto = getattr(sess, "auto_confirm", cfg["auto_confirm"])
+    mode_bak = cfg["mode"]
+    task = task.strip()
+    if not task:
+        return ""
+
+    # ---- 1. PLANEJAR ----
+    print()
+    print(c.bold(c.cyan("📋 ETAPA 1/4 — PLANEJAR")))
+    print(c.dim("   Separando a tarefa em etapas…"))
+    plan_sess = Session(cfg, c)
+    cfg["mode"] = "workflow_plan"
+    try:
+        plan = ask_model(plan_sess, False, c, auto) or ""
+    finally:
+        cfg["mode"] = mode_bak
+    plan = plan.strip()
+    if not plan:
+        plan = "(o modelo não gerou um plano)"
+    n_steps = _count_plan_steps(plan)
+    print()
+    print(c.bold("📋 Plano:"))
+    print(plan)
+    if n_steps >= 5:
+        print(c.yellow(f"⚠ Tarefa grande identificada — dividida em {n_steps} "
+                       "etapas organizadas por fase."))
+    if not auto and sys.stdin.isatty():
+        if not ask_yes_no(c, "Aprovar este plano e começar a construir?"):
+            print(c.yellow("Plano recusado pelo usuário. Nada foi construído."))
+            sess.messages.append({"role": "user", "content": task})
+            sess.messages.append({"role": "assistant",
+                                  "content": "Plano recusado pelo usuário."})
+            return plan
+
+    # ---- 2. CONSTRUIR ----
+    print()
+    print(c.bold(c.cyan("🔨 ETAPA 2/4 — CONSTRUIR")))
+    print(c.dim("   Executando o plano passo a passo…"))
+    build_sess = Session(cfg, c)
+    build_sess.messages = [
+        {"role": "user", "content": task},
+        {"role": "assistant", "content": plan},
+        {"role": "user", "content": "Agora EXECUTE o plano aprovado acima, "
+                                    "passo a passo, usando as ferramentas."},
+    ]
+    cfg["mode"] = "workflow_build"
+    try:
+        build_result = ask_model(build_sess, True, c, auto) or ""
+    finally:
+        cfg["mode"] = mode_bak
+    build_summary = build_result.strip()
+    if not build_summary:
+        for m in reversed(build_sess.messages):
+            if m.get("role") == "assistant" and m.get("content"):
+                build_summary = m["content"]
+                break
+
+    # ---- 3/4. VERIFICAR + CORRIGIR (até 3 ciclos) ----
+    report = ""
+    for cycle in range(1, WORKFLOW_MAX_FIX_CYCLES + 1):
+        print()
+        print(c.bold(c.cyan("✅ ETAPA 3/4 — VERIFICAR")))
+        ctx = (f"{task}\n\nO que foi construído até agora:\n"
+               f"{build_summary[:3000]}\n")
+        if cycle > 1:
+            ctx += f"\nCorreções aplicadas no ciclo {cycle - 1}.\n"
+        v_sess = Session(cfg, c)
+        v_sess.messages = [{
+            "role": "user",
+            "content": ctx + "\nVerifique se está tudo correto e funcionando. "
+                             "Rode testes/verificações com as ferramentas se "
+                             "necessário. Comece exatamente com 'VERIFICAÇÃO "
+                             "OK' ou 'PROBLEMAS:'.",
+        }]
+        cfg["mode"] = "workflow_verify"
+        try:
+            report = ask_model(v_sess, True, c, auto) or ""
+        finally:
+            cfg["mode"] = mode_bak
+        report = report.strip()
+        upper = report.upper()
+        ok = upper.startswith(("VERIFICAÇÃO OK", "VERIFICACAO OK", "✅"))
+        if ok or "PROBLEMAS" not in upper:
+            print()
+            print(c.green("✅ Verificação concluída."))
+            print(c.dim(report[:500]))
+            break
+        # precisa corrigir
+        print()
+        print(c.bold(c.yellow("🔧 ETAPA 4/4 — CORRIGIR")))
+        print(c.dim(f"   Ciclo de correção {cycle}/{WORKFLOW_MAX_FIX_CYCLES}…"))
+        f_sess = Session(cfg, c)
+        f_sess.messages = [{
+            "role": "user",
+            "content": ctx + "\nProblemas encontrados na verificação:\n" +
+                       report + "\n\nCorrija TODOS os problemas usando as "
+                       "ferramentas.",
+        }]
+        cfg["mode"] = "workflow_fix"
+        try:
+            fix_result = ask_model(f_sess, True, c, auto) or ""
+        finally:
+            cfg["mode"] = mode_bak
+        build_summary = build_summary + "\n" + fix_result.strip()
+    else:
+        print(c.yellow("⚠ Limite de ciclos de correção atingido "
+                       f"({WORKFLOW_MAX_FIX_CYCLES})."))
+
+    # histórico da sessão principal
+    sess.messages.append({"role": "user", "content": task})
+    sess.messages.append({"role": "assistant",
+                          "content": (f"[workflow] Plano:\n{plan}\n\n"
+                                      f"Verificação:\n{report[:1000]}")})
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -1137,7 +1853,8 @@ def load_session(sess, name):
 COMMANDS = [
     # (nome, sintaxe, descrição, categoria)
     ("/help", "/help", "Mostra esta ajuda", "básico"),
-    ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (arquivos, terminal, internet, pc)", "básico"),
+    ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (nativas e criadas por você)", "básico"),
+    ("/memoria", "/memoria", "Mostra a memória de longo prazo (~/.send/memoria.md)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
     ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
@@ -1146,6 +1863,7 @@ COMMANDS = [
     ("/code", "/code", "Modo coding: usa as skills (arquivos, terminal, internet, pc)", "modo"),
     ("/chat", "/chat", "Modo chat: só conversa, sem ferramentas", "modo"),
     ("/plan", "/plan", "Modo plano: só planeja, não executa nada", "modo"),
+    ("/workflow", "/workflow", "Modo workflow: Planejar → Construir → Verificar → Corrigir", "modo"),
     ("/tools", "/tools [on|off]", "Liga/desliga as ferramentas manualmente", "modo"),
     ("/status", "/status", "Mostra o estado da sessão", "sessão"),
     ("/save", "/save [arquivo]", "Salva a conversa em ~/.send/sessions/", "sessão"),
@@ -1316,31 +2034,49 @@ def show_command_menu(c):
             pass
 
 
+def _skill_known(name):
+    if name in SKILLS:
+        return True
+    return any(cs["name"] == name for cs in load_custom_skills())
+
+
 def cmd_skills(sess, rest, c, tools_enabled):
     cfg = sess.cfg
     skills = list(cfg.get("skills", SKILL_ORDER))
     parts = rest.split()
+    custom = load_custom_skills()
 
     if not parts:
         print("Skills do SEND:")
         for name in SKILL_ORDER:
             mark = "✅" if name in skills else "⬜"
             print(f"  {mark} {name:<10} {SKILLS[name]}")
+        if custom:
+            print()
+            print("  ⭐ Personalizadas (criadas por você):")
+            for cs in custom:
+                mark = "✅" if cs["name"] in skills else "⬜"
+                print(f"  {mark} {cs['name']:<10} {cs['description']}")
         print()
         print("  Use: /skills <nome> [on|off]   (ex.: /skills internet off)")
         print("       /skills on | off          (liga/desliga todas)")
+        print("  Para criar uma nova skill, peça ao SEND:")
+        print("    ex.: \"crie uma skill para formatar código Python\"")
+        print(f"  Skills criadas ficam em: {SKILLS_DIR}")
         return False, tools_enabled
+
+    all_on = list(SKILL_ORDER) + [cs["name"] for cs in custom]
 
     if len(parts) == 1:
         if parts[0] == "on":
-            cfg["skills"] = list(SKILL_ORDER)
+            cfg["skills"] = all_on
             save_config(cfg)
-            print("✅ Todas as skills ligadas: " + ", ".join(SKILL_ORDER))
+            print("✅ Todas as skills ligadas: " + ", ".join(all_on))
         elif parts[0] == "off":
             cfg["skills"] = []
             save_config(cfg)
             print("✅ Todas as skills desligadas — só conversa.")
-        elif parts[0] in SKILLS:
+        elif _skill_known(parts[0]):
             name = parts[0]
             if name in skills:
                 skills.remove(name)
@@ -1353,10 +2089,10 @@ def cmd_skills(sess, rest, c, tools_enabled):
             print(f"✅ Skill '{name}' {msg}. Ativas: {', '.join(skills) or 'nenhuma'}")
         else:
             print(c.yellow(f"Skill desconhecida: {parts[0]}. "
-                           f"Disponíveis: {', '.join(SKILL_ORDER)}"))
+                           f"Disponíveis: {', '.join(all_on)}"))
         return False, tools_enabled
 
-    if len(parts) == 2 and parts[0] in SKILLS and parts[1] in ("on", "off"):
+    if len(parts) == 2 and _skill_known(parts[0]) and parts[1] in ("on", "off"):
         name, state = parts
         if state == "on" and name not in skills:
             skills.append(name)
@@ -1435,6 +2171,23 @@ def handle_command(sess, line, c, tools_enabled):
         save_config(cfg)
         print("📋 Modo plano ativado (só planeja, não executa).")
         return False, False
+    if cmd == "/workflow":
+        cfg["mode"] = "workflow"
+        save_config(cfg)
+        print("🔁 Modo workflow ativado: cada tarefa passa pelas 4 etapas")
+        print("   📋 Planejar → 🔨 Construir → ✅ Verificar → 🔧 Corrigir")
+        return False, True
+    if cmd == "/memoria":
+        text = memory_summary(limit=8000)
+        if not text:
+            print("🧠 A memória de longo prazo está vazia.")
+            print(f"   Arquivo: {MEMORY_PATH}")
+            print("   O SEND grava aprendizado sozinho com a ferramenta "
+                  "'remember'.")
+        else:
+            print(c.bold(f"🧠 Memória de longo prazo ({MEMORY_PATH}):"))
+            print(text)
+        return False, tools_enabled
     if cmd == "/thinking":
         if rest in ("on", "off"):
             cfg["thinking"] = rest == "on"
@@ -1557,10 +2310,29 @@ def repl(sess, c, tools_enabled):
                 break
             continue
 
+        if cfg["mode"] == "workflow":
+            save_history([{"role": "user", "content": line}])
+            try:
+                run_workflow(sess, line, c, cfg)
+            except urllib.error.URLError as e:
+                print(c.red(f"✗ Não consegui conectar ao servidor ({cfg['base_url']})."))
+                print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+            except urllib.error.HTTPError as e:
+                print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
+                print(c.red(e.read().decode("utf-8", "replace")[:500]))
+            except ConnectionError as e:
+                print(c.red(f"✗ {e}"))
+            except KeyboardInterrupt:
+                print()
+            except Exception as e:
+                print(c.red(f"✗ Erro: {e}"))
+            continue
+
         sess.messages.append({"role": "user", "content": line})
         save_history([{"role": "user", "content": line}])
         try:
-            ask_model(sess, tools_enabled and cfg["mode"] != "plan", c, cfg["auto_confirm"])
+            ask_model(sess, tools_enabled and cfg["mode"] != "plan", c,
+                      getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         except urllib.error.URLError as e:
             print(c.red(f"✗ Não consegui conectar ao servidor ({cfg['base_url']})."))
             print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
@@ -1594,6 +2366,26 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
         print(c.yellow('Nenhum prompt. Use: send "sua pergunta" — ou rode só "send" '
                        "para o modo interativo."))
         return 1
+    if sess.cfg["mode"] == "workflow":
+        save_history([{"role": "user", "content": prompt}])
+        try:
+            run_workflow(sess, prompt, c, sess.cfg)
+        except urllib.error.URLError as e:
+            print(c.red(f"✗ Não consegui conectar ao servidor ({sess.cfg['base_url']})."))
+            print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+            return 2
+        except urllib.error.HTTPError as e:
+            print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
+            print(c.red(e.read().decode("utf-8", "replace")[:500]))
+            return 1
+        except ConnectionError as e:
+            print(c.red(f"✗ {e}"))
+            return 2
+        except Exception as e:
+            print(c.red(f"✗ Erro: {e}"))
+            return 1
+        return 0
+
     sess.messages.append({"role": "user", "content": prompt})
     save_history([{"role": "user", "content": prompt}])
     try:
@@ -1721,6 +2513,7 @@ def parse_args(argv=None):
                "  send \"explique este código\"   resposta única\n"
                "  send --code \"crie um app\"     modo coding\n"
                "  send --plan \"refatore x\"      modo plano\n"
+               "  send --workflow \"crie um app\" Planejar → Construir → Verificar → Corrigir\n"
                "  send --thinking \"pergunta\"    com raciocínio (se o modelo suportar)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1734,6 +2527,9 @@ def parse_args(argv=None):
                     help="modo coding: pode ler/escrever arquivos e executar comandos")
     ap.add_argument("-p", "--plan", action="store_true",
                     help="modo plano: só planeja, não executa nada")
+    ap.add_argument("-w", "--workflow", action="store_true",
+                    help="modo workflow: Planejar → Construir → Verificar → "
+                         "Corrigir (divide tarefas grandes em etapas)")
     ap.add_argument("--chat", action="store_true",
                     help="modo chat: sem ferramentas")
     ap.add_argument("--thinking", action="store_true",
@@ -1789,12 +2585,12 @@ def main(argv=None):
         cfg["reasoning_effort"] = args.reasoning_effort
     if args.temperature is not None:
         cfg["temperature"] = args.temperature
-    if args.yes:
-        cfg["auto_confirm"] = True
     if args.code:
         cfg["mode"] = "coding"
     elif args.plan:
         cfg["mode"] = "plan"
+    elif args.workflow:
+        cfg["mode"] = "workflow"
     elif args.chat:
         cfg["mode"] = "chat"
 
@@ -1830,14 +2626,18 @@ def main(argv=None):
             return 2
         print(c.yellow("⚠ " + str(e)))
 
-    tools_enabled = (cfg["mode"] == "coding") and not args.no_tools
+    tools_enabled = (cfg["mode"] in ("coding", "workflow")) and not args.no_tools
+
+    # -y vale só para esta sessão (não vai para a config salva)
+    sess.auto_confirm = bool(args.yes) or bool(cfg["auto_confirm"])
 
     prompt = " ".join(args.prompt).strip()
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read()
 
     if prompt:
-        return one_shot(sess, prompt, c, tools_enabled, cfg["auto_confirm"])
+        return one_shot(sess, prompt, c, tools_enabled,
+                        getattr(sess, "auto_confirm", cfg["auto_confirm"]))
 
     return repl(sess, c, tools_enabled)
 

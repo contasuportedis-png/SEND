@@ -70,9 +70,71 @@ send config set base_url http://127.0.0.1:5000
 
 ---
 
+## 🔁 Modo Workflow: Planejar → Construir → Verificar → Corrigir
+
+Igual ao Hermes/Claude: para tarefas maiores, o SEND trabalha em **4 etapas**:
+
+```bash
+send --workflow "crie um aplicativo de tarefas"   # uma vez
+# ou dentro do SEND:
+/workflow
+```
+
+1. **📋 Planejar** — separa a tarefa em etapas numeradas. Se a tarefa for
+   **muito grande** (5+ etapas), ela é dividida em fases com marcos. O SEND
+   **pede sua aprovação** antes de construir (a menos que use `-y`).
+2. **🔨 Construir** — executa o plano passo a passo usando as skills
+   (arquivos, terminal, git…).
+3. **✅ Verificar** — confere se está tudo funcionando: roda testes, lê os
+   arquivos criados, procura erros.
+4. **🔧 Corrigir** — se a verificação apontar problemas, corrige e **reverifica**
+   (até 3 ciclos de correção).
+
+```bash
+send --workflow "crie um app de tarefas em Python"      # com aprovação do plano
+send --workflow -y "crie um app de tarefas em Python"   # sem perguntar
+```
+
+## 🧠 Memória de longo prazo (aprende sozinho)
+
+O SEND tem um arquivo de memória (`~/.send/memoria.md`) que **aprende com o
+tempo**:
+
+- Toda conversa começa com a memória resumida no contexto do modelo;
+- Quando o SEND descobre algo útil (suas preferências, decisões do projeto,
+  bugs corrigidos), ele **grava sozinho** com a ferramenta `remember`;
+- Você vê tudo com `/memoria` e o arquivo pode ser editado à mão.
+
+```
+/memoria        # mostra a memória acumulada
+```
+
+## ⭐ Criar novas skills (o SEND aprende habilidades novas)
+
+Peça ao SEND para criar uma skill e ele salva um arquivo `.md` em
+`~/.send/skills/` que **fica disponível para sempre** — nas próximas conversas
+a skill vira uma ferramenta própria (`skill_<nome>`):
+
+```
+"crie uma skill para formatar código Python"
+"crie uma skill que gera relatórios em markdown"
+"crie uma skill para revisar meu código procurando bugs"
+```
+
+Cada skill criada aparece em `/skills` (⭐ Personalizadas), pode ser
+ligada/desligada (`/skills <nome> off`) e é executada como uma ferramenta
+quando você pedir. Formato do arquivo:
+
+```markdown
+# Skill: formatar
+Descrição: formata código com 4 espaços
+## Instruções
+Sempre use 4 espaços de indentação e remova linhas em branco extras.
+```
+
 ## 🧰 Skills — o que o SEND sabe fazer
 
-O SEND tem **4 skills** que podem ser ligadas e desligadas individualmente
+O SEND tem **7 skills** que podem ser ligadas e desligadas individualmente
 com `/skills`:
 
 | Skill | O que faz | Ferramentas |
@@ -81,11 +143,14 @@ com `/skills`:
 | **terminal** | Executa comandos no seu terminal | `run_command` |
 | **internet** | **Pesquisa na web** e lê o conteúdo de páginas | `web_search`, `fetch_url` |
 | **pc** | **Abre arquivos e links** no sistema e mostra **informações do PC** | `open_file`, `open_url`, `system_info` |
+| **git** | Opera repositórios git | `git_status`, `git_log`, `git_diff`, `git_commit` |
+| **processos** | Lista e encerra processos do sistema | `list_processes`, `kill_process` |
+| **memoria** | Aprende com o tempo e cria novas skills | `read_memory`, `remember`, `create_skill` |
 
 ```bash
-/skills                      # lista as skills ativas
+/skills                      # lista as skills ativas (nativas + criadas)
 /skills internet off         # desliga a pesquisa na internet
-/skills pc on                # liga a skill do PC
+/skills git on               # liga a skill do git
 /skills on | /skills off     # liga/desliga todas
 ```
 
@@ -97,6 +162,9 @@ send "procure o arquivo config.py no projeto"        # usa find_files
 send "mostre as informações do meu PC"               # usa system_info
 send "edite o arquivo notas.txt trocando 'velho' por 'novo'"  # usa edit_file
 send "abra o site do LM Studio no navegador"         # usa open_url
+send "mostre o status do git e o log"                # usa a skill git
+send "liste os processos pesados"                    # usa a skill processos
+send "lembre que eu uso Pop!_OS"                     # grava na memória
 ```
 
 > Dica: em modelos menores, desligar skills que não precisa deixa as
@@ -135,10 +203,12 @@ send                                    # modo interativo
 send "o que é um decorator em Python?"  # resposta única
 send --code "crie um jogo da velha em Python"
 send --plan "refatore meu projeto para usar classes"
+send --workflow "crie um app de tarefas"        # 4 etapas: planejar→construir→verificar→corrigir
 send --thinking "compare dois algoritmos de ordenação"
 send "pesquise na internet sobre LM Studio"     # skill internet
 send "mostre as informações do meu PC"          # skill pc
 send "procure o arquivo config.py"              # skill arquivos
+send "crie uma skill para revisar meu código"   # cria skill personalizada
 send --models                           # lista os modelos do LM Studio
 send --doctor                           # diagnostica a instalação
 send --update                           # atualiza para a versão mais recente
@@ -152,9 +222,9 @@ Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa**
 Também funciona o **Tab** para autocompletar comandos.
 
 ```
-/help     /skills [nome] [on|off]   /clear   /exit
+/help     /skills [nome] [on|off]   /memoria   /clear   /exit
 /model [nome]   /models   /thinking on|off
-/code     /chat   /plan    /tools on|off
+/code     /chat   /plan   /workflow   /tools on|off
 /status   /save [arquivo]  /load arquivo   /update   /doctor
 ```
 
