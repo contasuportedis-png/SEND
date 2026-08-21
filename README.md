@@ -70,6 +70,38 @@ send config set base_url http://127.0.0.1:5000
 
 ---
 
+## 🧰 Skills — o que o SEND sabe fazer
+
+O SEND tem **4 skills** que podem ser ligadas e desligadas individualmente
+com `/skills`:
+
+| Skill | O que faz | Ferramentas |
+|---|---|---|
+| **arquivos** | Lê, escreve, **edita**, lista e **procura** arquivos no PC | `read_file`, `write_file`, `edit_file`, `list_files`, `find_files` |
+| **terminal** | Executa comandos no seu terminal | `run_command` |
+| **internet** | **Pesquisa na web** e lê o conteúdo de páginas | `web_search`, `fetch_url` |
+| **pc** | **Abre arquivos e links** no sistema e mostra **informações do PC** | `open_file`, `open_url`, `system_info` |
+
+```bash
+/skills                      # lista as skills ativas
+/skills internet off         # desliga a pesquisa na internet
+/skills pc on                # liga a skill do PC
+/skills on | /skills off     # liga/desliga todas
+```
+
+Exemplos de uso:
+
+```bash
+send "pesquise na internet o que é LM Studio"        # usa a skill internet
+send "procure o arquivo config.py no projeto"        # usa find_files
+send "mostre as informações do meu PC"               # usa system_info
+send "edite o arquivo notas.txt trocando 'velho' por 'novo'"  # usa edit_file
+send "abra o site do LM Studio no navegador"         # usa open_url
+```
+
+> Dica: em modelos menores, desligar skills que não precisa deixa as
+> respostas mais rápidas e evita chamadas de ferramentas desnecessárias.
+
 ## 🧠 Modos de uso
 
 | Modo | Flag | O que faz |
@@ -104,17 +136,25 @@ send "o que é um decorator em Python?"  # resposta única
 send --code "crie um jogo da velha em Python"
 send --plan "refatore meu projeto para usar classes"
 send --thinking "compare dois algoritmos de ordenação"
+send "pesquise na internet sobre LM Studio"     # skill internet
+send "mostre as informações do meu PC"          # skill pc
+send "procure o arquivo config.py"              # skill arquivos
 send --models                           # lista os modelos do LM Studio
 send --doctor                           # diagnostica a instalação
 send --update                           # atualiza para a versão mais recente
 send --install                          # mostra como instalar em outra máquina
 ```
 
-### Comandos dentro do SEND
+### Comandos dentro do SEND — paleta `/`
+
+Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa**
+(navegue com as setas ↑↓ ou digite o número, Enter executa, Esc fecha).
+Também funciona o **Tab** para autocompletar comandos.
 
 ```
-/help     /exit   /clear   /model [nome]   /models
-/code     /chat   /plan    /thinking on|off /tools on|off
+/help     /skills [nome] [on|off]   /clear   /exit
+/model [nome]   /models   /thinking on|off
+/code     /chat   /plan    /tools on|off
 /status   /save [arquivo]  /load arquivo   /update   /doctor
 ```
 

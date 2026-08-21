@@ -9,6 +9,17 @@ MODELS = [
     {"id": "deepseek-r1-distill", "object": "model", "owned_by": "mock"},
 ]
 
+# Mapa: ferramenta -> (id do call, argumentos)
+TOOL_PLAN = {
+    "pesquise na internet": ("call_search", "web_search",
+                             '{"query": "inteligencia artificial local", "max_results": 3}'),
+    "informacoes do pc": ("call_sys", "system_info", "{}"),
+    "edite o arquivo": ("call_edit", "edit_file",
+                        '{"path": "notas.txt", "old_text": "velho", "new_text": "novo"}'),
+    "liste os arquivos": ("call_list", "list_files", '{"path": "."}'),
+    "procure": ("call_find", "find_files", '{"pattern": "*.md"}'),
+}
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
@@ -43,37 +54,43 @@ class Handler(BaseHTTPRequestHandler):
         last = msgs[-1] if msgs else {}
         tools = payload.get("tools")
         thinking = bool(payload.get("reasoning_effort"))
+        tool_names = [t["function"]["name"] for t in tools] if tools else []
 
-        # Já existe resultado de ferramenta? Então é a rodada final.
+        # ---- Depois de uma ferramenta executada: responde o resultado ----
         if last.get("role") == "tool":
-            content = ("O arquivo README.md foi lido com sucesso. "
-                       "Ele documenta o projeto SEND.")
+            content = ("Resultado da ferramenta recebido. Consegui a "
+                       "informação que você pediu. " + user_text)
             event = {"choices": [{"index": 0, "delta": {"content": content}}]}
-        # Simula o modelo chamando a ferramenta read_file
-        elif tools and "leia o arquivo" in user_text.lower():
-            event = {
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "call_mock1",
-                            "function": {
-                                "name": "read_file",
-                                "arguments": '{"path": "README.md"}',
-                            },
-                        }]
-                    },
-                }]
-            }
         else:
-            answer = "Olá! Este é o modelo simulado. " + user_text
-            if "plano" in user_text.lower():
-                answer = ("PLANO:\n1. Analisar o projeto\n2. Criar arquivos\n"
-                          "3. Testar\nDeseja que eu execute?")
-            event = {
-                "choices": [{"index": 0, "delta": {"content": answer}}]
-            }
+            # ---- Decide qual ferramenta chamar (se estiver disponível) ----
+            call_info = None
+            for key, (cid, fname, fargs) in TOOL_PLAN.items():
+                if key in user_text.lower() and fname in tool_names:
+                    call_info = (cid, fname, fargs)
+                    break
+            if call_info is None and "leia o arquivo" in user_text.lower() and "read_file" in tool_names:
+                call_info = ("call_read", "read_file", '{"path": "README.md"}')
+
+            if call_info:
+                cid, fname, fargs = call_info
+                event = {
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": cid,
+                                "function": {"name": fname, "arguments": fargs},
+                            }]
+                        },
+                    }]
+                }
+            else:
+                answer = "Olá! Este é o modelo simulado. " + user_text
+                if "plano" in user_text.lower():
+                    answer = ("PLANO:\n1. Analisar o projeto\n2. Criar arquivos\n"
+                              "3. Testar\nDeseja que eu execute?")
+                event = {"choices": [{"index": 0, "delta": {"content": answer}}]}
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

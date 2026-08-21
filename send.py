@@ -21,14 +21,21 @@ Uso:
 """
 
 import argparse
+import difflib
+import fnmatch
+import html.parser
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import webbrowser
 from pathlib import Path
 
 try:
@@ -43,7 +50,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
@@ -110,6 +117,37 @@ DEFAULT_CONFIG = {
     "show_reasoning": True,
     "auto_confirm": False,         # -y
     "temperature": 0.7,
+    "skills": ["arquivos", "terminal", "internet", "pc"],
+}
+
+# ---------------------------------------------------------------------------
+# Skills — habilidades que o SEND pode usar
+# ---------------------------------------------------------------------------
+
+SKILLS = {
+    "arquivos": "ler, escrever, editar, listar e procurar arquivos no PC",
+    "terminal": "executar comandos no terminal",
+    "internet": "pesquisar na web e ler o conteúdo de páginas",
+    "pc": "abrir arquivos/links no sistema e ver informações do PC",
+}
+
+SKILL_ORDER = ["arquivos", "terminal", "internet", "pc"]
+
+USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 "
+              "Firefox/126.0")
+
+# Endpoint de busca (padrão: DuckDuckGo, sem chave de API).
+# Pode ser trocado com a variável SEND_SEARCH_URL (útil para testes).
+SEARCH_URL = os.environ.get(
+    "SEND_SEARCH_URL", "https://html.duckduckgo.com/html/?q={q}"
+)
+
+# Pastas ignoradas ao procurar arquivos
+IGNORED_DIRS = {
+    ".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build",
+    "target", ".next", ".cache", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".tox", ".nox", ".nuxt", ".output", ".parcel-cache", ".svelte-kit",
+    ".turbo", ".vite", ".idea", ".vscode",
 }
 
 
@@ -265,6 +303,7 @@ TOOLS = [
                 "required": ["path"],
             },
         },
+        "skill": "arquivos",
     },
     {
         "type": "function",
@@ -288,6 +327,40 @@ TOOLS = [
                 "required": ["path", "content"],
             },
         },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edita um arquivo existente: substitui um trecho de "
+                           "texto por outro. Use replace_all para substituir "
+                           "todas as ocorrências. Retorna um diff das mudanças.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Caminho do arquivo (relativo ou absoluto).",
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Trecho exato que será substituído.",
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Texto novo no lugar do antigo.",
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Se true, substitui todas as ocorrências "
+                                       "(padrão: só a primeira).",
+                    },
+                },
+                "required": ["path", "old_text", "new_text"],
+            },
+        },
+        "skill": "arquivos",
     },
     {
         "type": "function",
@@ -304,6 +377,35 @@ TOOLS = [
                 },
             },
         },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Procura arquivos pelo nome (texto parcial ou padrão "
+                           "com * e ?) dentro de uma pasta. Ignora node_modules, "
+                           ".git, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Nome ou padrão a procurar (ex.: *.py).",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Pasta onde procurar (padrão: atual).",
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Limite de resultados (padrão 50).",
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+        "skill": "arquivos",
     },
     {
         "type": "function",
@@ -326,9 +428,102 @@ TOOLS = [
                 "required": ["command"],
             },
         },
+        "skill": "terminal",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Pesquisa na internet (DuckDuckGo) e retorna os "
+                           "principais resultados com título, link e resumo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "O que pesquisar.",
+                    },
+                    "max_results": {
+                        "type": "number",
+                        "description": "Quantos resultados (padrão 5, máx 10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+        "skill": "internet",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Baixa uma página da internet e devolve o texto "
+                           "principal (sem HTML). Use para ler notícias, docs, "
+                           "tutoriais, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL completa (http ou https).",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+        "skill": "internet",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "system_info",
+            "description": "Mostra informações do PC: sistema operacional, "
+                           "processador, memória RAM, disco e Python.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+        "skill": "pc",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_file",
+            "description": "Abre um arquivo ou pasta no programa padrão do "
+                           "sistema (explorador de arquivos, editor etc.).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Caminho do arquivo ou pasta.",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+        "skill": "pc",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_url",
+            "description": "Abre uma URL no navegador padrão do usuário.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "URL completa (http ou https).",
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+        "skill": "pc",
     },
 ]
-
 
 def ask_yes_no(c, question, default=False):
     if not sys.stdin.isatty():
@@ -425,17 +620,280 @@ def execute_tool(name, args, c, auto_confirm):
                 if not ask_yes_no(c, f"Escrever arquivo '{args.get('path', '?')}'?"):
                     return None
             return tool_write(args, c)
+        if name == "edit_file":
+            if not auto_confirm:
+                if not ask_yes_no(c, f"Editar arquivo '{args.get('path', '?')}'?"):
+                    return None
+            return tool_edit(args, c)
         if name == "list_files":
             return tool_list(args, c)
+        if name == "find_files":
+            return tool_find(args, c)
         if name == "run_command":
             if not auto_confirm:
                 preview = args.get("command", "")[:80]
                 if not ask_yes_no(c, f"Executar comando: {preview}…"):
                     return None
             return tool_run(args, c)
+        if name == "web_search":
+            return tool_web_search(args, c)
+        if name == "fetch_url":
+            return tool_fetch_url(args, c)
+        if name == "system_info":
+            return tool_system_info(args, c)
+        if name == "open_file":
+            return tool_open_file(args, c)
+        if name == "open_url":
+            return tool_open_url(args, c)
         return f"Ferramenta desconhecida: {name}"
     except Exception as e:
         return f"Erro ao executar {name}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Implementação das skills
+# ---------------------------------------------------------------------------
+
+def _resolve_path(path, default="."):
+    p = Path(path or default).expanduser()
+    if not p.is_absolute():
+        p = Path.cwd() / p
+    return p.resolve()
+
+
+def tool_edit(args, c):
+    p = _resolve_path(args.get("path", ""))
+    if not p.exists():
+        return f"Erro: arquivo não encontrado: {p}"
+    if not p.is_file():
+        return f"Erro: '{p}' não é um arquivo."
+    old = args.get("old_text", "")
+    new = args.get("new_text", "")
+    if not old:
+        return "Erro: old_text vazio."
+    try:
+        text = p.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "Erro: arquivo binário, não posso editar."
+    if old not in text:
+        return (f"Erro: o trecho não foi encontrado no arquivo.\n"
+                f"Sugestões próximas: {', '.join(difflib.get_close_matches(old, text.splitlines(), n=3)[:3]) or 'nenhuma'}")
+    if args.get("replace_all"):
+        n = text.count(old)
+        text = text.replace(old, new)
+    else:
+        n = 1
+        text = text.replace(old, new, 1)
+    p.write_text(text, encoding="utf-8")
+    return f"✅ {n} substituição(ões) feita(s) em {p}"
+
+
+def tool_find(args, c):
+    pattern = args.get("pattern", "")
+    base = _resolve_path(args.get("path", "."))
+    try:
+        max_results = int(args.get("max_results") or 50)
+    except (TypeError, ValueError):
+        max_results = 50
+    max_results = max(1, min(max_results, 200))
+    if not base.exists():
+        return f"Erro: pasta não encontrada: {base}"
+    if not base.is_dir():
+        return f"Erro: '{base}' não é uma pasta."
+    matches = []
+    try:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for f in files:
+                if fnmatch.fnmatch(f.lower(), pattern.lower()):
+                    matches.append(str(Path(root) / f))
+                    if len(matches) >= max_results:
+                        break
+            if len(matches) >= max_results:
+                break
+    except PermissionError:
+        return "Erro: sem permissão para ler alguma pasta."
+    if not matches:
+        return f"Nenhum arquivo encontrado com o padrão '{pattern}' em {base}"
+    return f"{len(matches)} arquivo(s) encontrado(s):\n" + "\n".join(matches)
+
+
+class _TextExtractor(html.parser.HTMLParser):
+    """Extrai o texto de uma página HTML, pulando script/style."""
+
+    BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+             "tr", "section", "article", "header", "footer", "blockquote",
+             "pre", "ul", "ol"}
+
+    def __init__(self):
+        super().__init__()
+        self.parts = []
+        self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "noscript", "svg", "head"):
+            self.skip += 1
+        if tag in self.BLOCK and self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "noscript", "svg", "head") and self.skip:
+            self.skip -= 1
+        if tag in self.BLOCK and self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self.skip:
+            s = re.sub(r"\s+", " ", data).strip()
+            if s:
+                self.parts.append(s + " ")
+
+    def text(self):
+        raw = "".join(self.parts)
+        return re.sub(r"\n\s*\n+", "\n\n", raw).strip()
+
+    def feed_and_text(self, data):
+        self.feed(data)
+        return self.text()
+
+
+def _http_get(url, timeout=20):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _safe_url(url):
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+def tool_web_search(args, c):
+    query = args.get("query", "").strip()
+    if not query:
+        return "Erro: query vazia."
+    try:
+        max_results = int(args.get("max_results") or 5)
+    except (TypeError, ValueError):
+        max_results = 5
+    max_results = max(1, min(max_results, 10))
+    url = SEARCH_URL.format(q=urllib.parse.quote_plus(query))
+    try:
+        with _http_get(url) as resp:
+            html_text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as e:
+        return f"Erro ao pesquisar: {e.reason}. Sem internet?"
+    except Exception as e:
+        return f"Erro ao pesquisar: {e}"
+
+    results = []
+    # DuckDuckGo HTML: cada resultado é um <a class="result__a" href="...">
+    for m in re.finditer(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                         html_text, re.S):
+        link = m.group(1)
+        if link.startswith("//"):
+            link = "https:" + link
+        # o DDG usa redirecionamentos /l/?uddg=<url>; extrai o link real
+        uddg = urllib.parse.parse_qs(urllib.parse.urlparse(link).query).get("uddg")
+        if uddg:
+            link = uddg[0]
+        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        title = html.unescape(title) if hasattr(html, "unescape") else title
+        results.append((title, link))
+        if len(results) >= max_results:
+            break
+    if not results:
+        # fallback: qualquer link externo com texto
+        for m in re.finditer(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                             html_text, re.S):
+            link = m.group(1)
+            if "duckduckgo.com" in link or "duck.co" in link:
+                continue
+            title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            if title:
+                results.append((title, link))
+            if len(results) >= max_results:
+                break
+    if not results:
+        return "Nenhum resultado encontrado (ou o site de busca mudou o layout)."
+    out = [f"Resultados para: {query}", ""]
+    for i, (title, link) in enumerate(results, 1):
+        out.append(f"{i}. {title}\n   {link}")
+    return "\n".join(out)
+
+
+def tool_fetch_url(args, c):
+    url = _safe_url(args.get("url", "").strip())
+    if not url:
+        return "Erro: url vazia."
+    try:
+        with _http_get(url) as resp:
+            ctype = resp.headers.get("Content-Type", "")
+            data = resp.read(512 * 1024)  # máximo 512 KB
+    except urllib.error.URLError as e:
+        return f"Erro ao abrir {url}: {e.reason}. Sem internet?"
+    except Exception as e:
+        return f"Erro ao abrir {url}: {e}"
+    if "text" not in ctype and "html" not in ctype:
+        return f"({url} — conteúdo do tipo {ctype or 'desconhecido'}, {len(data)} bytes; não é texto)"
+    text = _TextExtractor().feed_and_text(data.decode("utf-8", errors="replace"))
+    if len(text) > TOOL_OUTPUT_LIMIT:
+        text = text[:TOOL_OUTPUT_LIMIT] + "\n… (texto truncado)"
+    return f"Conteúdo de {url}:\n\n{text or '(página sem texto legível)'}"
+
+
+def tool_system_info(args, c):
+    lines = [
+        f"Sistema     : {platform.system()} {platform.release()}",
+        f"Arquitetura : {platform.machine()}",
+        f"Processador : {platform.processor() or 'desconhecido'}",
+        f"Usuário     : {os.environ.get('USER') or os.environ.get('USERNAME') or '?'}",
+        f"Diretório   : {Path.cwd()}",
+        f"Python      : {sys.version.split()[0]}",
+    ]
+    try:
+        if os.name == "nt":
+            total = shutil.disk_usage(Path.cwd().anchor).total
+            lines.append(f"Disco total : {total // (1024**3)} GB")
+        else:
+            with open("/proc/meminfo") as f:
+                for ln in f:
+                    if ln.startswith("MemTotal"):
+                        kb = int(ln.split()[1])
+                        lines.append(f"Memória RAM : {kb // 1024 // 1024} GB")
+                        break
+            st = os.statvfs(Path.cwd().anchor or "/")
+            lines.append(f"Disco total : {st.f_bsize * st.f_blocks // (1024**3)} GB")
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def tool_open_file(args, c):
+    p = _resolve_path(args.get("path", ""))
+    if not p.exists():
+        return f"Erro: arquivo/pasta não encontrado: {p}"
+    try:
+        if os.name == "nt":
+            os.startfile(str(p))  # noqa: S606
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+        return f"✅ Aberto: {p}"
+    except Exception as e:
+        return f"Erro ao abrir: {e}"
+
+
+def tool_open_url(args, c):
+    url = _safe_url(args.get("url", "").strip())
+    if not url:
+        return "Erro: url vazia."
+    try:
+        webbrowser.open(url)
+        return f"✅ Navegador aberto: {url}"
+    except Exception as e:
+        return f"Erro ao abrir o navegador: {e}"
 
 
 def compact_args(args):
@@ -467,7 +925,8 @@ def call_model(sess, tools_enabled, c, cfg):
         "temperature": cfg["temperature"],
     }
     if tools_enabled:
-        payload["tools"] = TOOLS
+        payload["tools"] = [t for t in TOOLS
+                            if t.get("skill") in cfg.get("skills", SKILL_ORDER)]
         payload["tool_choice"] = "auto"
     if cfg["thinking"]:
         payload["reasoning_effort"] = cfg["reasoning_effort"]
@@ -671,28 +1130,246 @@ def load_session(sess, name):
 # Modo interativo (REPL)
 # ---------------------------------------------------------------------------
 
-HELP_TEXT = """\
-Comandos do SEND:
-  /help               mostra esta ajuda
-  /exit, /quit        sai do SEND
-  /clear              limpa a conversa atual
-  /model [nome]       mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)
-  /models             lista os modelos carregados no LM Studio
-  /code               modo coding: ferramentas de arquivo e comandos
-  /chat               modo chat: só conversa, sem ferramentas
-  /plan               modo plano: só planeja, não executa nada
-  /thinking [on|off]  liga/desliga o pensamento do modelo
-  /tools [on|off]     liga/desliga as ferramentas manualmente
-  /status             mostra o estado da sessão
-  /save [arquivo]     salva a conversa em ~/.send/sessions/
-  /load arquivo       carrega uma conversa salva
-  /update             atualiza o SEND para a versão mais recente
-  /doctor             diagnostica a instalação e a conexão com o LM Studio
+# ---------------------------------------------------------------------------
+# Comandos do SEND (paleta "/")
+# ---------------------------------------------------------------------------
 
-Dicas:
-  • use \\ no fim da linha para continuar em outra linha
-  • Ctrl+C interrompe a resposta; Ctrl+C de novo sai
-"""
+COMMANDS = [
+    # (nome, sintaxe, descrição, categoria)
+    ("/help", "/help", "Mostra esta ajuda", "básico"),
+    ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (arquivos, terminal, internet, pc)", "básico"),
+    ("/clear", "/clear", "Limpa a conversa atual", "básico"),
+    ("/exit", "/exit", "Sai do SEND", "básico"),
+    ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
+    ("/models", "/models", "Lista os modelos carregados no LM Studio", "modelo"),
+    ("/thinking", "/thinking [on|off]", "Liga/desliga o pensamento do modelo", "modelo"),
+    ("/code", "/code", "Modo coding: usa as skills (arquivos, terminal, internet, pc)", "modo"),
+    ("/chat", "/chat", "Modo chat: só conversa, sem ferramentas", "modo"),
+    ("/plan", "/plan", "Modo plano: só planeja, não executa nada", "modo"),
+    ("/tools", "/tools [on|off]", "Liga/desliga as ferramentas manualmente", "modo"),
+    ("/status", "/status", "Mostra o estado da sessão", "sessão"),
+    ("/save", "/save [arquivo]", "Salva a conversa em ~/.send/sessions/", "sessão"),
+    ("/load", "/load arquivo", "Carrega uma conversa salva", "sessão"),
+    ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o LM Studio", "sistema"),
+    ("/update", "/update", "Atualiza o SEND para a versão mais recente", "sistema"),
+]
+
+COMMAND_CATEGORIES = ["básico", "modelo", "modo", "sessão", "sistema"]
+
+
+def build_help_text():
+    lines = ["Comandos do SEND — digite / e Enter para abrir a paleta:", ""]
+    for cat in COMMAND_CATEGORIES:
+        lines.append(f"  {cat.upper()}:")
+        for name, syntax, desc, ccat in COMMANDS:
+            if ccat == cat:
+                lines.append(f"    {syntax:<36} {desc}")
+        lines.append("")
+    lines.append("Dicas:")
+    lines.append("  • digite / e Enter → paleta de comandos interativa")
+    lines.append("  • Tab completa comandos que começam com /")
+    lines.append("  • use \\ no fim da linha para continuar em outra linha")
+    lines.append("  • Ctrl+C interrompe a resposta; Ctrl+C de novo sai")
+    return "\n".join(lines)
+
+
+HELP_TEXT = build_help_text()
+
+
+def _read_nonblock(fd):
+    """Lê 1 byte do stdin sem bloquear; None se não houver nada.
+
+    Cobre os dois lugares onde bytes podem estar esperando: o fd (via select)
+    e os buffers internos do TextIOWrapper (via leitura com fd não-bloqueante).
+    """
+    import select
+    if select.select([sys.stdin], [], [], 0.0)[0]:
+        return sys.stdin.read(1)
+    try:
+        import fcntl
+    except ImportError:  # Windows usa o menu numerado; nunca chega aqui
+        return None
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    try:
+        try:
+            return sys.stdin.read(1)
+        except (BlockingIOError, OSError, ValueError):
+            return None
+    finally:
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+
+
+def show_command_menu(c):
+    """Paleta de comandos interativa (setas ↑↓ + Enter). Retorna o comando
+    escolhido ou None se cancelado."""
+    flat = []
+    for cat in COMMAND_CATEGORIES:
+        flat.append(("cat", cat))
+        for name, syntax, desc, ccat in COMMANDS:
+            if ccat == cat:
+                flat.append(("cmd", name, syntax, desc))
+
+    def draw(idx):
+        out = []
+        for i, item in enumerate(flat):
+            if item[0] == "cat":
+                out.append(c.cyan(c.bold("  " + item[1].upper())))
+            else:
+                marker = c.bold(c.cyan("❯")) if i == idx else " "
+                out.append(f" {marker} {item[2]:<34} {c.dim(item[3])}")
+        return out
+
+    # Fallback para Windows/sem TTY: lista numerada
+    if os.name == "nt" or not sys.stdin.isatty():
+        print(c.bold("Comandos do SEND:"))
+        nums = []
+        n = 1
+        for i, item in enumerate(flat):
+            if item[0] == "cat":
+                print(c.cyan(c.bold("  " + item[1].upper())))
+            else:
+                print(f"  {n}. {item[2]:<34} {c.dim(item[3])}")
+                nums.append((n, item[1]))
+                n += 1
+        print()
+        try:
+            r = input(c.dim("Escolha um número (Enter para cancelar): ")).strip()
+            if not r:
+                return None
+            for num, name in nums:
+                if str(num) == r:
+                    return name
+            print(c.yellow(f"Número inválido: {r}"))
+            return None
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+    import select
+    import termios
+    import tty
+
+    idx = 1  # primeiro comando (índice 0 é o cabeçalho da 1ª categoria)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    sys.stdout.write("\n")
+    try:
+        tty.setraw(fd)
+        lines = draw(idx)
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("q", "Q", "\x03"):
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return None
+            if ch == "\r":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                selected = flat[idx]
+                return selected[1] if selected[0] == "cmd" else None
+            if ch == "\x1b":
+                # ESC pode ser sozinho (cancelar) ou início de seta (ESC [ A/B)
+                seq = ""
+                for _ in range(2):
+                    b = _read_nonblock(fd)
+                    if b is None:
+                        # espera um pouco (entrega atrasada do terminal)
+                        select.select([sys.stdin], [], [], 0.3)
+                        b = _read_nonblock(fd)
+                    if b is None:
+                        break
+                    seq += b
+                if seq == "[A":
+                    idx = (idx - 1) % len(flat)
+                    while flat[idx][0] != "cmd":
+                        idx = (idx - 1) % len(flat)
+                elif seq == "[B":
+                    idx = (idx + 1) % len(flat)
+                    while flat[idx][0] != "cmd":
+                        idx = (idx + 1) % len(flat)
+                elif seq in ("[C", "[D"):
+                    pass
+                else:
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return None
+            elif ch.isdigit():
+                # atalho por número (1-9)
+                num = int(ch)
+                cmd_items = [i for i in flat if i[0] == "cmd"]
+                if 1 <= num <= len(cmd_items):
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return cmd_items[num - 1][1]
+            sys.stdout.write("\r\x1b[K" + ("\x1b[1A\r\x1b[K" * (len(flat) - 1)))
+            lines = draw(idx)
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+    except (KeyboardInterrupt, EOFError):
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+
+
+def cmd_skills(sess, rest, c, tools_enabled):
+    cfg = sess.cfg
+    skills = list(cfg.get("skills", SKILL_ORDER))
+    parts = rest.split()
+
+    if not parts:
+        print("Skills do SEND:")
+        for name in SKILL_ORDER:
+            mark = "✅" if name in skills else "⬜"
+            print(f"  {mark} {name:<10} {SKILLS[name]}")
+        print()
+        print("  Use: /skills <nome> [on|off]   (ex.: /skills internet off)")
+        print("       /skills on | off          (liga/desliga todas)")
+        return False, tools_enabled
+
+    if len(parts) == 1:
+        if parts[0] == "on":
+            cfg["skills"] = list(SKILL_ORDER)
+            save_config(cfg)
+            print("✅ Todas as skills ligadas: " + ", ".join(SKILL_ORDER))
+        elif parts[0] == "off":
+            cfg["skills"] = []
+            save_config(cfg)
+            print("✅ Todas as skills desligadas — só conversa.")
+        elif parts[0] in SKILLS:
+            name = parts[0]
+            if name in skills:
+                skills.remove(name)
+                msg = "desligada"
+            else:
+                skills.append(name)
+                msg = "ligada"
+            cfg["skills"] = skills
+            save_config(cfg)
+            print(f"✅ Skill '{name}' {msg}. Ativas: {', '.join(skills) or 'nenhuma'}")
+        else:
+            print(c.yellow(f"Skill desconhecida: {parts[0]}. "
+                           f"Disponíveis: {', '.join(SKILL_ORDER)}"))
+        return False, tools_enabled
+
+    if len(parts) == 2 and parts[0] in SKILLS and parts[1] in ("on", "off"):
+        name, state = parts
+        if state == "on" and name not in skills:
+            skills.append(name)
+        elif state == "off" and name in skills:
+            skills.remove(name)
+        cfg["skills"] = skills
+        save_config(cfg)
+        print(f"✅ Skill '{name}' {'ligada' if state == 'on' else 'desligada'}. "
+              f"Ativas: {', '.join(skills) or 'nenhuma'}")
+        return False, tools_enabled
+
+    print(c.yellow("Uso: /skills <nome> [on|off] ou /skills on|off"))
+    return False, tools_enabled
 
 
 def handle_command(sess, line, c, tools_enabled):
@@ -778,13 +1455,17 @@ def handle_command(sess, line, c, tools_enabled):
         print(f"🔧 Ferramentas: {'ligadas' if tools_enabled else 'desligadas'}")
         return False, tools_enabled
     if cmd == "/status":
+        skills = cfg.get("skills", SKILL_ORDER)
         print(f"  Servidor : {cfg['base_url']}")
         print(f"  Modelo   : {sess.model_id or cfg['model'] or 'auto'}")
         print(f"  Modo     : {cfg['mode']}")
         print(f"  Ferramentas: {'sim' if tools_enabled else 'não'}")
         print(f"  Pensamento : {'sim' if cfg['thinking'] else 'não'}")
+        print(f"  Skills   : {', '.join(skills) if skills else 'nenhuma'}")
         print(f"  Config   : {CONFIG_PATH}")
         return False, tools_enabled
+    if cmd == "/skills":
+        return cmd_skills(sess, rest, c, tools_enabled)
     if cmd == "/save":
         save_session(sess, rest or None)
         return False, tools_enabled
@@ -802,6 +1483,17 @@ def handle_command(sess, line, c, tools_enabled):
         return False, tools_enabled
     print(c.yellow(f"Comando desconhecido: {cmd} (use /help)"))
     return False, tools_enabled
+
+
+def _command_completer(text, state):
+    """Autocomplete de comandos que começam com '/' (via Tab)."""
+    if text.startswith("/"):
+        candidates = [name for name, *_ in COMMANDS if name.startswith(text)]
+    else:
+        candidates = []
+    if state < len(candidates):
+        return candidates[state] + " "
+    return None
 
 
 def read_input(prompt, c):
@@ -830,12 +1522,15 @@ def repl(sess, c, tools_enabled):
     cfg = sess.cfg
     print()
     print(c.bold(c.cyan(f" ⚡ SEND v{VERSION}")) + " — assistente de IA no terminal (LM Studio)")
-    print(c.dim("   Digite /help para os comandos • Ctrl+C para sair"))
+    print(c.dim("   Digite / para abrir a paleta de comandos • /help • Ctrl+C para sair"))
     print()
 
     if readline:
         try:
             readline.read_history_file(str(INPUT_HISTORY))
+            readline.set_completer(_command_completer)
+            readline.set_completer_delims(" \t")
+            readline.parse_and_bind("tab: complete")
         except Exception:
             pass
 
@@ -851,6 +1546,11 @@ def repl(sess, c, tools_enabled):
         line = line.strip()
         if not line:
             continue
+        if line == "/":
+            choice = show_command_menu(c)
+            if not choice:
+                continue
+            line = choice
         if line.startswith("/"):
             do_exit, tools_enabled = handle_command(sess, line, c, tools_enabled)
             if do_exit:
