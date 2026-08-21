@@ -50,7 +50,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
@@ -119,7 +119,16 @@ DEFAULT_CONFIG = {
     "temperature": 0.7,
     "skills": ["arquivos", "terminal", "internet", "pc",
                "git", "processos", "memoria"],
+    "auto_backend": True,          # detecta LM Studio → Ollama automaticamente
+    "project_context": True,       # injeta a árvore do projeto no contexto
+    "auto_summarize": True,        # resume conversas longas automaticamente
 }
+
+OLLAMA_URL = "http://127.0.0.1:11434"
+
+# Backups automáticos antes de editar/escrever arquivos
+BACKUP_DIR = SEND_HOME / "backups"
+BACKUP_INDEX = BACKUP_DIR / "index.json"
 
 # ---------------------------------------------------------------------------
 # Skills — habilidades que o SEND pode usar
@@ -257,6 +266,125 @@ def get_tools(cfg):
         if cs["name"] in enabled:
             tools.append(custom_skill_tool(cs))
     return tools
+
+
+def backup_file(path):
+    """Salva uma cópia de segurança de um arquivo antes de alterá-lo.
+
+    Retorna o caminho do backup (ou None se não for possível/faltar arquivo).
+    Os backups ficam em ~/.send/backups/ com um índice em index.json.
+    """
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        idx = []
+        if BACKUP_INDEX.exists():
+            try:
+                idx = json.loads(BACKUP_INDEX.read_text(encoding="utf-8"))
+            except Exception:
+                idx = []
+        flat = str(path).replace("\\", "_").replace("/", "_").replace(" ", "_")
+        name = f"{ts}__{flat}"
+        dest = BACKUP_DIR / name
+        shutil.copy2(path, dest)
+        idx.append({"ts": ts, "original": str(path), "backup": name})
+        # mantém só os 100 backups mais recentes
+        idx = idx[-100:]
+        BACKUP_INDEX.write_text(
+            json.dumps(idx, ensure_ascii=False, indent=2), encoding="utf-8")
+        return dest
+    except Exception:
+        return None
+
+
+def list_backups():
+    """Lista os backups disponíveis (mais recentes primeiro)."""
+    try:
+        if not BACKUP_INDEX.exists():
+            return []
+        idx = json.loads(BACKUP_INDEX.read_text(encoding="utf-8"))
+        return list(reversed(idx))
+    except Exception:
+        return []
+
+
+def restore_backup(n, c):
+    """Restaura o n-ésimo backup (1 = mais recente)."""
+    backups = list_backups()
+    if not backups:
+        return "Nenhum backup encontrado em " + str(BACKUP_DIR)
+    if not 1 <= n <= len(backups):
+        return (f"Número inválido (1–{len(backups)}).")
+    b = backups[n - 1]
+    orig = Path(b["original"])
+    src = BACKUP_DIR / b["backup"]
+    if not src.exists():
+        return f"Arquivo de backup não encontrado: {src}"
+    orig.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, orig)
+    return f"✅ Restaurado: {orig} (backup de {b['ts']})"
+
+
+def detect_backend(cfg, c):
+    """Auto-detecta o backend quando o padrão (LM Studio) não responde.
+
+    Tenta LM Studio (1234) → Ollama (11434). Retorna a URL usada.
+    """
+    if not cfg.get("auto_backend", True):
+        return cfg["base_url"]
+    if cfg["base_url"] != DEFAULT_BASE_URL:
+        return cfg["base_url"]  # URL customizada: não mexe
+    try:
+        list_models(cfg["base_url"], cfg["api_key"])
+        return cfg["base_url"]  # LM Studio responde
+    except Exception:
+        pass
+    try:
+        list_models(OLLAMA_URL, cfg["api_key"])
+        print(c.yellow(f"⚡ LM Studio não respondeu — detectei o Ollama em "
+                       f"{OLLAMA_URL} (use /backend para trocar)."))
+        return OLLAMA_URL
+    except Exception:
+        return cfg["base_url"]
+
+
+def project_tree(max_entries=25, max_depth=2):
+    """Árvore curta do diretório atual para dar contexto ao modelo."""
+    try:
+        root = Path.cwd()
+        lines = [f"Projeto atual: {root}"]
+        counter = [0]
+
+        def walk(path, depth):
+            if counter[0] >= max_entries:
+                return
+            try:
+                entries = sorted(
+                    [e for e in path.iterdir() if e.name not in IGNORED_DIRS],
+                    key=lambda x: (x.is_file(), x.name.lower()),
+                )
+            except PermissionError:
+                return
+            for e in entries:
+                if counter[0] >= max_entries:
+                    return
+                if e.is_dir():
+                    lines.append("  " * depth + e.name + "/")
+                    counter[0] += 1
+                    if depth < max_depth:
+                        walk(e, depth + 1)
+                else:
+                    lines.append("  " * depth + e.name)
+                    counter[0] += 1
+
+        walk(root, 1)
+        if counter[0] >= max_entries:
+            lines.append("  … (truncado)")
+        return "\n".join(lines)
+    except Exception:
+        return ""
 
 
 
@@ -434,6 +562,10 @@ def system_prompt(cfg, extra=""):
             "\n\n## Memória de longo prazo (aprendizado acumulado)\n" + mem
         )
         parts.append(MEMORY_PROMPT_HINT)
+    if cfg.get("project_context", True) and mode in ("coding", "workflow"):
+        tree = project_tree()
+        if tree:
+            parts.append("\n\n## Estrutura do projeto atual\n" + tree)
     if extra:
         parts.append(" Instrução adicional do usuário: " + extra)
     return "".join(parts)
@@ -915,6 +1047,7 @@ def tool_write(args, c):
         p = Path.cwd() / p
     p = p.resolve()
     content = args.get("content", "")
+    backup_file(p)  # cópia de segurança antes de sobrescrever
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"Arquivo escrito: {p} ({len(content.encode('utf-8'))} bytes)"
@@ -1064,6 +1197,7 @@ def tool_edit(args, c):
     else:
         n = 1
         text = text.replace(old, new, 1)
+    backup_file(p)  # cópia de segurança antes de alterar
     p.write_text(text, encoding="utf-8")
     return f"✅ {n} substituição(ões) feita(s) em {p}"
 
@@ -1491,6 +1625,64 @@ class Session:
         self.c = c
         self.messages = []
         self.model_id = None
+        self.summary = None   # resumo de conversas anteriores (auto-summarize)
+
+
+# Limite de mensagens antes de resumir a conversa automaticamente
+SUMMARY_THRESHOLD = 16
+SUMMARY_KEEP = 6
+
+
+def summarize_conversation(sess, c):
+    """Resume as mensagens antigas da conversa para economizar contexto.
+
+    Mantém as últimas SUMMARY_KEEP mensagens e guarda o resumo em
+    sess.summary, que é injetado no prompt de sistema. Retorna True se
+    resumiu, False caso contrário.
+    """
+    msgs = sess.messages
+    if len(msgs) <= SUMMARY_THRESHOLD:
+        return False
+    if sess.summary is not None and len(msgs) <= SUMMARY_THRESHOLD + SUMMARY_KEEP:
+        return False
+    old = msgs[: -SUMMARY_KEEP]
+    recent = msgs[-SUMMARY_KEEP:]
+
+    # monta o texto a resumir (limita tamanho)
+    lines = []
+    for m in old:
+        role = {"user": "Usuário", "assistant": "SEND",
+                "tool": "Ferramenta", "system": "Sistema"}.get(m.get("role"), "?")
+        content = m.get("content") or ""
+        if isinstance(content, str) and content.strip():
+            lines.append(f"{role}: {content[:300]}")
+    text = "\n".join(lines)
+    if len(text) > 6000:
+        text = text[:6000] + "\n…"
+
+    sub_cfg = dict(sess.cfg)
+    sub_cfg["mode"] = "chat"
+    sub = Session(sub_cfg, c)
+    sub.messages = [{
+        "role": "user",
+        "content": ("Resuma em português as mensagens abaixo desta conversa "
+                    "entre usuário e assistente de IA (mantenha decisões, "
+                    "preferências, arquivos citados e pendências):\n\n" + text),
+    }]
+    try:
+        summary = ask_model(sub, False, c, True) or ""
+    except Exception:
+        return False
+    summary = summary.strip()
+    if not summary:
+        return False
+
+    sess.summary = summary
+    sess.messages = recent
+    n = len(old)
+    print(c.dim(f"🧠 Conversa resumida automaticamente "
+                f"({n} mensagens → resumo). Use /resumo para ver."))
+    return True
 
 
 def call_model(sess, tools_enabled, c, cfg):
@@ -1498,6 +1690,11 @@ def call_model(sess, tools_enabled, c, cfg):
     if sess.model_id is None:
         sess.model_id = resolve_model(cfg, c)
     extra = getattr(sess, "extra_system", "")
+    summary = getattr(sess, "summary", None)
+    if summary:
+        extra = (f"Resumo de mensagens anteriores desta conversa (não "
+                 f"responda ao resumo, apenas use como contexto):\n{summary}"
+                 + (("\n\n" + extra) if extra else ""))
     messages = [{"role": "system",
                  "content": system_prompt(cfg, extra)}] + sess.messages
     payload = {
@@ -1855,20 +2052,25 @@ COMMANDS = [
     ("/help", "/help", "Mostra esta ajuda", "básico"),
     ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (nativas e criadas por você)", "básico"),
     ("/memoria", "/memoria", "Mostra a memória de longo prazo (~/.send/memoria.md)", "básico"),
+    ("/resumo", "/resumo", "Resume a conversa atual (economiza contexto)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
     ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
-    ("/models", "/models", "Lista os modelos carregados no LM Studio", "modelo"),
+    ("/models", "/models", "Lista os modelos carregados no servidor", "modelo"),
     ("/thinking", "/thinking [on|off]", "Liga/desliga o pensamento do modelo", "modelo"),
+    ("/backend", "/backend [lmstudio|ollama|url]", "Mostra ou troca o servidor (LM Studio / Ollama)", "modelo"),
     ("/code", "/code", "Modo coding: usa as skills (arquivos, terminal, internet, pc)", "modo"),
     ("/chat", "/chat", "Modo chat: só conversa, sem ferramentas", "modo"),
     ("/plan", "/plan", "Modo plano: só planeja, não executa nada", "modo"),
     ("/workflow", "/workflow", "Modo workflow: Planejar → Construir → Verificar → Corrigir", "modo"),
     ("/tools", "/tools [on|off]", "Liga/desliga as ferramentas manualmente", "modo"),
     ("/status", "/status", "Mostra o estado da sessão", "sessão"),
+    ("/config", "/config [chave] [valor]", "Mostra ou altera a configuração", "sessão"),
     ("/save", "/save [arquivo]", "Salva a conversa em ~/.send/sessions/", "sessão"),
     ("/load", "/load arquivo", "Carrega uma conversa salva", "sessão"),
-    ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o LM Studio", "sistema"),
+    ("/backups", "/backups [restore n]", "Lista/restaura backups de arquivos alterados", "sistema"),
+    ("/contexto", "/contexto [on|off]", "Liga/desliga o contexto do projeto no prompt", "sistema"),
+    ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o servidor", "sistema"),
     ("/update", "/update", "Atualiza o SEND para a versão mais recente", "sistema"),
 ]
 
@@ -2040,6 +2242,111 @@ def _skill_known(name):
     return any(cs["name"] == name for cs in load_custom_skills())
 
 
+# Chaves de configuração editáveis pelo usuário via /config
+EDITABLE_CONFIG = {
+    "base_url": str, "api_key": str, "model": str, "temperature": float,
+    "thinking": bool, "reasoning_effort": str, "show_reasoning": bool,
+    "auto_confirm": bool, "auto_backend": bool, "project_context": bool,
+    "auto_summarize": bool, "mode": str,
+}
+
+
+def _parse_config_value(key, raw):
+    t = EDITABLE_CONFIG[key]
+    if t is bool:
+        return raw.lower() in ("true", "1", "sim", "yes", "on")
+    if t is float:
+        return float(raw)
+    return raw
+
+
+def cmd_config(sess, rest, c, tools_enabled):
+    cfg = sess.cfg
+    parts = rest.split()
+
+    if not parts:
+        print(c.bold("Configuração atual:"))
+        for k, v in cfg.items():
+            if k == "skills":
+                continue
+            mark = "" if k in EDITABLE_CONFIG else c.dim(" (fixa)")
+            print(f"  {k:<18} = {v}{mark}")
+        print()
+        print("  Edite com: /config <chave> <valor>")
+        print(f"  Ex.: /config temperature 0.3 • /config thinking true • "
+              f"/config base_url http://127.0.0.1:1234")
+        return False, tools_enabled
+
+    key = parts[0]
+    if key not in EDITABLE_CONFIG:
+        print(c.yellow(f"Chave desconhecida: {key}. "
+                       f"Editáveis: {', '.join(sorted(EDITABLE_CONFIG))}"))
+        return False, tools_enabled
+    if len(parts) < 2:
+        print(f"  {key} = {cfg.get(key)}")
+        return False, tools_enabled
+    raw = " ".join(parts[1:])
+    try:
+        value = _parse_config_value(key, raw)
+    except ValueError:
+        print(c.yellow(f"Valor inválido para {key}: {raw!r}"))
+        return False, tools_enabled
+    cfg[key] = value
+    save_config(cfg)
+    print(f"✅ {key} = {value}")
+    return False, tools_enabled
+
+
+def cmd_backups(sess, rest, c, tools_enabled):
+    parts = rest.split()
+    backups = list_backups()
+
+    if parts and parts[0] == "restore":
+        if len(parts) < 2 or not parts[1].isdigit():
+            print("Uso: /backups restore <n>   (n = número da lista)")
+            return False, tools_enabled
+        n = int(parts[1])
+        print(restore_backup(n, c))
+        return False, tools_enabled
+
+    if not backups:
+        print("Nenhum backup ainda. Os arquivos alterados pelo SEND são "
+              f"salvos automaticamente em {BACKUP_DIR} antes de mudar.")
+        print("  Use: /backups restore <n> para restaurar.")
+        return False, tools_enabled
+    print(c.bold(f"Backups ({len(backups)}):"))
+    for i, b in enumerate(backups, 1):
+        print(f"  {i:>3}. {b['ts']}  {b['original']}")
+    print()
+    print("  Restaure com: /backups restore <n>")
+    return False, tools_enabled
+
+
+def cmd_backend(sess, rest, c, tools_enabled):
+    cfg = sess.cfg
+    if not rest:
+        print(f"  Servidor atual: {cfg['base_url']}")
+        print(f"  Auto-detecção: {'ligada' if cfg.get('auto_backend', True) else 'desligada'}")
+        print("  Troque com: /backend lmstudio | ollama | <url>")
+        return False, tools_enabled
+    arg = rest.strip().lower()
+    if arg == "lmstudio":
+        url = DEFAULT_BASE_URL
+    elif arg == "ollama":
+        url = OLLAMA_URL
+    elif arg.startswith("http://") or arg.startswith("https://"):
+        url = arg
+    else:
+        print(c.yellow("Use: /backend lmstudio | ollama | <url>"))
+        return False, tools_enabled
+    cfg["base_url"] = url.rstrip("/")
+    cfg["auto_backend"] = False
+    save_config(cfg)
+    sess.model_id = None  # força re-detecção do modelo no novo servidor
+    print(f"✅ Servidor: {cfg['base_url']}")
+    return False, tools_enabled
+
+
 def cmd_skills(sess, rest, c, tools_enabled):
     cfg = sess.cfg
     skills = list(cfg.get("skills", SKILL_ORDER))
@@ -2188,6 +2495,37 @@ def handle_command(sess, line, c, tools_enabled):
             print(c.bold(f"🧠 Memória de longo prazo ({MEMORY_PATH}):"))
             print(text)
         return False, tools_enabled
+    if cmd == "/resumo":
+        if sess.summary:
+            print(c.bold("🧠 Resumo da conversa (parte resumida):"))
+            print(sess.summary)
+        if len(sess.messages) <= 2:
+            print(c.yellow("A conversa ainda é curta — nada a resumir."))
+            return False, tools_enabled
+        print(c.dim("Gerando resumo…"))
+        n = len(sess.messages)
+        if summarize_conversation(sess, c):
+            print(c.green(f"✅ Resumo criado ({n} mensagens → resumo)."))
+        else:
+            print(c.yellow("Não foi possível resumir agora (conversa curta ou "
+                           "erro)."))
+        return False, tools_enabled
+    if cmd == "/config":
+        return cmd_config(sess, rest, c, tools_enabled)
+    if cmd == "/backups":
+        return cmd_backups(sess, rest, c, tools_enabled)
+    if cmd == "/backend":
+        return cmd_backend(sess, rest, c, tools_enabled)
+    if cmd == "/contexto":
+        if rest in ("on", "off"):
+            cfg["project_context"] = rest == "on"
+            save_config(cfg)
+            print(f"📂 Contexto do projeto: {'ligado' if rest == 'on' else 'desligado'}")
+        else:
+            print(f"📂 Contexto do projeto: "
+                  f"{'ligado' if cfg.get('project_context', True) else 'desligado'} "
+                  f"(use /contexto on|off)")
+        return False, tools_enabled
     if cmd == "/thinking":
         if rest in ("on", "off"):
             cfg["thinking"] = rest == "on"
@@ -2239,13 +2577,24 @@ def handle_command(sess, line, c, tools_enabled):
 
 
 def _command_completer(text, state):
-    """Autocomplete de comandos que começam com '/' (via Tab)."""
+    """Autocomplete: comandos que começam com '/' ou caminhos de arquivos."""
     if text.startswith("/"):
         candidates = [name for name, *_ in COMMANDS if name.startswith(text)]
     else:
+        # completa caminhos de arquivos/pastas (glob)
+        base = text.rsplit("/", 1)[0] + "/" if "/" in text else ""
+        try:
+            entries = sorted(Path(base or ".").glob(text.split("/")[-1] + "*"))
+        except Exception:
+            entries = []
         candidates = []
+        for e in entries:
+            cand = (base + e.name) if base else e.name
+            if e.is_dir():
+                cand += "/"
+            candidates.append(cand)
     if state < len(candidates):
-        return candidates[state] + " "
+        return candidates[state]
     return None
 
 
@@ -2310,6 +2659,13 @@ def repl(sess, c, tools_enabled):
                 break
             continue
 
+        # resume automaticamente conversas longas para economizar contexto
+        if cfg.get("auto_summarize", True) and len(sess.messages) > SUMMARY_THRESHOLD:
+            try:
+                summarize_conversation(sess, c)
+            except Exception:
+                pass
+
         if cfg["mode"] == "workflow":
             save_history([{"role": "user", "content": line}])
             try:
@@ -2330,9 +2686,10 @@ def repl(sess, c, tools_enabled):
 
         sess.messages.append({"role": "user", "content": line})
         save_history([{"role": "user", "content": line}])
+        t0 = time.time()
         try:
-            ask_model(sess, tools_enabled and cfg["mode"] != "plan", c,
-                      getattr(sess, "auto_confirm", cfg["auto_confirm"]))
+            content = ask_model(sess, tools_enabled and cfg["mode"] != "plan", c,
+                                getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         except urllib.error.URLError as e:
             print(c.red(f"✗ Não consegui conectar ao servidor ({cfg['base_url']})."))
             print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
@@ -2345,6 +2702,11 @@ def repl(sess, c, tools_enabled):
             print()
         except Exception as e:
             print(c.red(f"✗ Erro: {e}"))
+        else:
+            if content:
+                dt = time.time() - t0
+                tokens = max(1, len(content) // 4)
+                print(c.dim(f"    ⏱ {dt:.1f}s · ≈{tokens} tokens"))
         if sess.messages and sess.messages[-1]["role"] == "assistant":
             save_history([sess.messages[-1]])
 
@@ -2388,8 +2750,10 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
 
     sess.messages.append({"role": "user", "content": prompt})
     save_history([{"role": "user", "content": prompt}])
+    t0 = time.time()
     try:
-        ask_model(sess, tools_enabled and sess.cfg["mode"] != "plan", c, auto_confirm)
+        content = ask_model(sess, tools_enabled and sess.cfg["mode"] != "plan",
+                            c, auto_confirm)
     except urllib.error.URLError as e:
         print(c.red(f"✗ Não consegui conectar ao servidor ({sess.cfg['base_url']})."))
         print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
@@ -2404,6 +2768,11 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
     except Exception as e:
         print(c.red(f"✗ Erro: {e}"))
         return 1
+    else:
+        if content:
+            dt = time.time() - t0
+            tokens = max(1, len(content) // 4)
+            print(c.dim(f"    ⏱ {dt:.1f}s · ≈{tokens} tokens"))
     if sess.messages and sess.messages[-1]["role"] == "assistant":
         save_history([sess.messages[-1]])
     return 0
@@ -2618,6 +2987,9 @@ def main(argv=None):
         return doctor(cfg, c)
 
     sess = Session(cfg, c)
+    # auto-detecta o backend (LM Studio → Ollama) antes da 1ª chamada
+    if args.base_url is None:
+        cfg["base_url"] = detect_backend(cfg, c)
     try:
         sess.model_id = resolve_model(cfg, c)
     except ConnectionError as e:

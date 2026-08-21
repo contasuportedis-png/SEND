@@ -2,14 +2,14 @@
 
 Um CLI de IA no estilo **Claude Code / Gemini CLI**, que roda **100% local** e
 grátis usando os modelos que você já instalou no
-[LM Studio](https://lmstudio.ai/). Funciona no **Linux (Pop!_OS, Ubuntu…)**,
-**Windows** e macOS.
+[LM Studio](https://lmstudio.ai/) (ou no [Ollama](https://ollama.com/)).
+Funciona no **Linux (Pop!_OS, Ubuntu…)**, **Windows** e macOS.
 
 Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.0.0 — assistente de IA no terminal (LM Studio)
+⚡ SEND v1.3.0 — assistente de IA no terminal (LM Studio)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -45,7 +45,23 @@ pedir). Abra um **novo terminal** e use `send --doctor` e depois `send`.
 > disponíveis na página de [Releases](https://github.com/contasuportedis-png/SEND/releases).
 
 > Pré-requisito (os dois sistemas): **Python 3** instalado e o **LM Studio**
-> com o servidor local ligado.
+> com o servidor local ligado (ou o **Ollama** rodando — o SEND detecta
+> automaticamente os dois).
+
+## 🔄 Backend automático: LM Studio **ou** Ollama
+
+O SEND tenta o LM Studio (`http://127.0.0.1:1234`) primeiro; se não estiver
+rodando, **detecta sozinho o Ollama** (`http://127.0.0.1:11434`) e avisa.
+Para trocar manualmente:
+
+```
+/backend                # mostra o servidor atual
+/backend lmstudio       # volta para o LM Studio (1234)
+/backend ollama         # usa o Ollama (11434)
+/backend http://127.0.0.1:5000   # servidor compatível com a API OpenAI
+```
+
+A auto-detecção pode ser desligada com `/config auto_backend false`.
 
 ---
 
@@ -108,6 +124,40 @@ tempo**:
 ```
 /memoria        # mostra a memória acumulada
 ```
+
+## 🧠 Resumo automático de conversas longas
+
+Modelos locais têm contexto limitado — por isso o SEND **resume sozinho**
+conversas longas (16+ mensagens): o trecho antigo vira um resumo que continua
+no contexto, sem perder as decisões importantes.
+
+```
+/resumo         # resume a conversa agora (e mostra o resumo atual)
+```
+
+A conversa nunca "estoura" o contexto: você pode conversar por horas.
+Desligue com `/config auto_summarize false`.
+
+## 💾 Backups automáticos (nunca perca um arquivo)
+
+Antes de **escrever ou editar** qualquer arquivo, o SEND salva uma cópia em
+`~/.send/backups/`:
+
+```
+/backups              # lista os backups (mais recentes primeiro)
+/backups restore 1    # restaura o backup 1 (o mais recente)
+```
+
+Se uma edição der errado, o arquivo original volta em um comando.
+
+## 📁 Contexto do projeto e estatísticas
+
+- O SEND injeta no prompt a **árvore do projeto atual** (pastas e arquivos,
+  ignorando `node_modules`, `.git` etc.) para entender com o que está
+  trabalhando — desligue com `/contexto off`.
+- Ao final de cada resposta, mostra o **tempo e o tamanho**:
+  `⏱ 1.2s · ≈340 tokens`.
+- Configure tudo com `/config` (temperatura, thinking, auto-resumo, etc.).
 
 ## ⭐ Criar novas skills (o SEND aprende habilidades novas)
 
@@ -222,10 +272,11 @@ Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa**
 Também funciona o **Tab** para autocompletar comandos.
 
 ```
-/help     /skills [nome] [on|off]   /memoria   /clear   /exit
-/model [nome]   /models   /thinking on|off
+/help     /skills [nome] [on|off]   /memoria   /resumo   /clear   /exit
+/model [nome]   /models   /thinking on|off   /backend [lmstudio|ollama|url]
 /code     /chat   /plan   /workflow   /tools on|off
-/status   /save [arquivo]  /load arquivo   /update   /doctor
+/status   /config [chave] [valor]   /save [arquivo]  /load arquivo
+/backups [restore n]   /contexto [on|off]   /update   /doctor
 ```
 
 ---

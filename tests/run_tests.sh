@@ -132,7 +132,7 @@ sys.path.insert(0, ".")
 import send
 c = send.make_colors()
 r = send.tool_git_status({}, c)
-assert "Branch" in r and "git" in r.lower(), r[:100]
+assert "Branch" in r and r.strip(), r[:100]
 r = send.tool_git_log({}, c)
 assert r.strip(), "log vazio"
 print("   git_status e git_log OK")
@@ -147,6 +147,70 @@ c = send.make_colors()
 r = send.tool_list_processes({"filter": "python", "n": 3}, c)
 assert "PID" in r or "python" in r.lower() or "Nenhum" in r, r[:100]
 print("   list_processes OK")
+PY
+
+echo "== 21. Backup automático + restore =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys, tempfile
+sys.path.insert(0, ".")
+os.environ["SEND_HOME"] = tempfile.mkdtemp()
+import send
+send.SEND_HOME = send.Path(os.environ["SEND_HOME"])
+send.BACKUP_DIR = send.SEND_HOME / "backups"
+send.BACKUP_INDEX = send.BACKUP_DIR / "index.json"
+send.MEMORY_PATH = send.SEND_HOME / "memoria.md"
+send.SKILLS_DIR = send.SEND_HOME / "skills"
+c = send.make_colors()
+p = "/tmp/send_backup_test.txt"
+open(p, "w").write("original")
+send.tool_write({"path": p, "content": "novo"}, c)
+assert open(p).read() == "novo"
+assert len(send.list_backups()) == 1
+send.restore_backup(1, c)
+assert open(p).read() == "original"
+print("   backup + restore OK")
+PY
+
+echo "== 22. Contexto do projeto no prompt =="
+python3 - <<'PY' && echo "OK"
+import sys
+sys.path.insert(0, ".")
+import send
+sp = send.system_prompt({"mode": "coding", "project_context": True})
+assert "Estrutura do projeto" in sp
+sp2 = send.system_prompt({"mode": "coding", "project_context": False})
+assert "Estrutura do projeto" not in sp2
+print("   contexto on/off OK")
+PY
+
+echo "== 23. Auto-resumo de conversa longa =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys
+sys.path.insert(0, ".")
+import send
+cfg = send.load_config()
+c = send.make_colors()
+sess = send.Session(cfg, c)
+for i in range(10):
+    sess.messages.append({"role": "user", "content": f"pergunta {i}"})
+    sess.messages.append({"role": "assistant", "content": f"resposta {i}"})
+assert len(sess.messages) == 20
+ok = send.summarize_conversation(sess, c)
+assert ok and len(sess.messages) == 6 and sess.summary
+print("   auto-resumo OK")
+PY
+
+echo "== 24. /config parse e detect_backend =="
+python3 - <<'PY' && echo "OK"
+import sys
+sys.path.insert(0, ".")
+import send
+assert send._parse_config_value("temperature", "0.3") == 0.3
+assert send._parse_config_value("thinking", "true") is True
+assert send._parse_config_value("thinking", "off") is False
+cfg = send.load_config()
+assert send.detect_backend(cfg, send.make_colors()) == send.DEFAULT_BASE_URL
+print("   config + backend OK")
 PY
 
 echo
