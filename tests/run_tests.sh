@@ -462,6 +462,9 @@ grep -q "ETAPA 1/4" /tmp/send_wf_test.log && echo "   workflow OK"
 SEND_HOME=$(mktemp -d) python3 send.py "oi" < /dev/null > /tmp/send_chat_test.log 2>&1 || true
 grep -q "modelo simulado" /tmp/send_chat_test.log && echo "   chat OK"
 
+echo "== 36. Providers de nuvem, customizados e autocomplete =="
+python3 -m unittest tests/test_providers.py
+
 echo
 if grep -qE "Traceback|AssertionError|^✗ " "$_TEST_LOG"; then
   echo "❌ A suíte registrou erros (Traceback/AssertionError) — revise acima."

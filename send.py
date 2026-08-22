@@ -3,8 +3,8 @@
 """
 SEND — assistente de IA para terminal (estilo Claude Code / Gemini CLI).
 
-Conecta automaticamente ao LM Studio (http://127.0.0.1:1234) ou a qualquer
-servidor compatível com a API da OpenAI.
+Conecta automaticamente ao LM Studio/Ollama ou a providers de nuvem e
+servidores customizados compatíveis com a API da OpenAI.
 
 Modos:
   - chat   : conversa normal, sem ferramentas
@@ -24,6 +24,7 @@ import argparse
 import atexit
 import difflib
 import fnmatch
+import getpass
 import html.parser
 import json
 import os
@@ -52,8 +53,92 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
+OLLAMA_URL = "http://127.0.0.1:11434"
+
+# Todos os serviços abaixo expõem uma API compatível com OpenAI. Isso mantém
+# ferramentas e streaming iguais entre nuvem e modelos locais. As chaves podem
+# vir do ambiente, evitando gravá-las no config.json.
+PROVIDER_PRESETS = {
+    "auto": {
+        "name": "Automático (LM Studio → Ollama)",
+        "base_url": DEFAULT_BASE_URL, "env_key": "", "local": True,
+    },
+    "lmstudio": {
+        "name": "LM Studio (local)",
+        "base_url": DEFAULT_BASE_URL, "env_key": "", "local": True,
+    },
+    "ollama": {
+        "name": "Ollama (local)",
+        "base_url": OLLAMA_URL, "env_key": "", "local": True,
+    },
+    "claude": {
+        "name": "Claude (Anthropic)", "base_url": "https://api.anthropic.com",
+        "env_key": "ANTHROPIC_API_KEY", "api_format": "anthropic",
+    },
+    "openai": {
+        "name": "OpenAI", "base_url": "https://api.openai.com",
+        "env_key": "OPENAI_API_KEY",
+    },
+    "nvidia": {
+        "name": "NVIDIA NIM", "base_url": "https://integrate.api.nvidia.com",
+        "env_key": "NVIDIA_API_KEY",
+    },
+    "gemini": {
+        "name": "Google Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "api_prefix": "", "env_key": "GEMINI_API_KEY",
+    },
+    "mistral": {
+        "name": "Mistral AI", "base_url": "https://api.mistral.ai",
+        "env_key": "MISTRAL_API_KEY",
+    },
+    "groq": {
+        "name": "Groq", "base_url": "https://api.groq.com/openai",
+        "env_key": "GROQ_API_KEY",
+    },
+    "cohere": {
+        "name": "Cohere", "base_url": "https://api.cohere.ai/compatibility",
+        "env_key": "COHERE_API_KEY",
+    },
+    "together": {
+        "name": "Together AI", "base_url": "https://api.together.xyz",
+        "env_key": "TOGETHER_API_KEY",
+    },
+    "perplexity": {
+        "name": "Perplexity", "base_url": "https://api.perplexity.ai",
+        "api_prefix": "", "env_key": "PERPLEXITY_API_KEY",
+    },
+    "deepseek": {
+        "name": "DeepSeek", "base_url": "https://api.deepseek.com",
+        "env_key": "DEEPSEEK_API_KEY",
+    },
+    "xai": {
+        "name": "xAI (Grok)", "base_url": "https://api.x.ai",
+        "env_key": "XAI_API_KEY",
+    },
+    "openrouter": {
+        "name": "OpenRouter", "base_url": "https://openrouter.ai/api",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    "azure": {
+        "name": "Azure OpenAI", "base_url": "https://RESOURCE.openai.azure.com/openai",
+        "env_key": "AZURE_OPENAI_API_KEY", "needs_endpoint": True,
+        "endpoint_hint": "https://SEU-RECURSO.openai.azure.com/openai",
+    },
+    "bedrock": {
+        "name": "AWS Bedrock", "base_url": "https://bedrock-mantle.us-east-1.api.aws",
+        "env_key": "AWS_BEARER_TOKEN_BEDROCK", "needs_endpoint": True,
+        "endpoint_hint": "https://bedrock-mantle.REGIAO.api.aws",
+    },
+    "huggingface": {
+        "name": "Hugging Face Inference",
+        "base_url": "https://router.huggingface.co",
+        "env_key": "HF_TOKEN",
+    },
+}
+
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
 )
@@ -158,7 +243,7 @@ def banner(c, model=None, mode=None):
     if mode:
         info += f"  ·  modo: {mode}"
     print(c.dim("  " + info))
-    print(c.dim("  digite / + Enter para a paleta de comandos · /help · Ctrl+C para sair"))
+    print(c.dim("  digite / para a paleta de comandos · /help · Ctrl+C para sair"))
     print()
 
 
@@ -485,7 +570,10 @@ def offer_save_code(content, c, cfg, auto_confirm, dest_dir=None):
 DEFAULT_CONFIG = {
     "base_url": DEFAULT_BASE_URL,
     "api_key": "",
-    "model": None,                 # None = detecta o primeiro modelo do LM Studio
+    "model": None,                 # None = detecta o primeiro modelo disponível
+    "provider": "auto",            # preset ou id de um provider customizado
+    "providers": {},               # configurações/último modelo por provider
+    "setup_complete": False,        # assistente de primeira inicialização concluído
     "mode": "coding",              # chat | coding | plan | workflow
     "thinking": False,
     "reasoning_effort": "medium",  # low | medium | high
@@ -503,8 +591,6 @@ DEFAULT_CONFIG = {
     "auto_mode": True,             # escolhe o modo sozinho (chat/coding/plan/workflow)
     "outmode": False,              # OUTMODE: age sem pedir autorização
 }
-
-OLLAMA_URL = "http://127.0.0.1:11434"
 
 # Backups automáticos antes de editar/escrever arquivos
 BACKUP_DIR = SEND_HOME / "backups"
@@ -1225,12 +1311,12 @@ def detect_backend(cfg, c):
     if cfg["base_url"] != DEFAULT_BASE_URL:
         return cfg["base_url"]  # URL customizada: não mexe
     try:
-        list_models(cfg["base_url"], cfg["api_key"])
+        list_models(cfg["base_url"], provider_api_key(cfg))
         return cfg["base_url"]  # LM Studio responde
     except Exception:
         pass
     try:
-        list_models(OLLAMA_URL, cfg["api_key"])
+        list_models(OLLAMA_URL, provider_api_key(cfg))
         print(c.yellow(f"⚡ LM Studio não respondeu — detectei o Ollama em "
                        f"{OLLAMA_URL} (use /backend para trocar)."))
         return OLLAMA_URL
@@ -1276,20 +1362,187 @@ def project_tree(max_entries=25, max_depth=2):
 
 
 
+def provider_spec(cfg, provider_id=None):
+    """Devolve a configuração efetiva de um provider (preset ou customizado)."""
+    provider_id = provider_id or cfg.get("provider", "auto")
+    spec = dict(PROVIDER_PRESETS.get(provider_id, {}))
+    spec.update(cfg.get("providers", {}).get(provider_id, {}))
+    spec.setdefault("id", provider_id)
+    spec.setdefault("name", provider_id)
+    return spec
+
+
+def provider_api_url(cfg, endpoint, spec=None):
+    """Monta uma URL respeitando providers cujo endpoint não usa `/v1`."""
+    spec = spec or provider_spec(cfg)
+    prefix = spec.get("api_prefix", "/v1").rstrip("/")
+    custom_path = spec.get(f"{endpoint.strip('/').replace('/', '_')}_path")
+    path = custom_path if custom_path is not None else prefix + "/" + endpoint.lstrip("/")
+    if not str(path).startswith("/"):
+        path = "/" + str(path)
+    return spec["base_url"].rstrip("/") + path
+
+
+def provider_api_key(cfg, spec=None):
+    """Chave efetiva: variável do provider > SEND_API_KEY > chave salva."""
+    spec = spec or provider_spec(cfg)
+    env_name = spec.get("env_key", "")
+    saved = spec.get("api_key", "")
+    # O campo legado só pertence ao provider que está ativo. Nunca o reutilize
+    # ao trocar (por exemplo, não envie uma chave OpenAI para a Anthropic).
+    legacy = cfg.get("api_key", "") if spec.get("id") == cfg.get("provider") else ""
+    return ((os.environ.get(env_name) if env_name else None)
+            or os.environ.get("SEND_API_KEY") or saved or legacy)
+
+
+def activate_provider(cfg, provider_id, remember_current=True):
+    """Ativa um provider e sincroniza os campos legados base_url/api_key/model."""
+    if provider_id not in PROVIDER_PRESETS and provider_id not in cfg.get("providers", {}):
+        raise KeyError(provider_id)
+    providers = cfg.setdefault("providers", {})
+    old_id = cfg.get("provider", "auto")
+    if remember_current and old_id in providers:
+        providers[old_id]["model"] = cfg.get("model")
+    spec = provider_spec(cfg, provider_id)
+    cfg["provider"] = provider_id
+    cfg["base_url"] = spec["base_url"].rstrip("/")
+    # Variáveis de ambiente são resolvidas só no momento da chamada e nunca
+    # copiadas para config.json.
+    cfg["api_key"] = spec.get("api_key", "")
+    cfg["model"] = spec.get("model")
+    # Só o preset auto alterna sozinho entre os dois servidores locais.
+    cfg["auto_backend"] = provider_id == "auto"
+    return spec
+
+
+def _safe_provider_id(name):
+    value = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-")
+    return value or "custom"
+
+
+def configure_provider(cfg, provider_id, c, input_fn=input):
+    """Configura um preset ou cria um provider OpenAI-compatible customizado."""
+    providers = cfg.setdefault("providers", {})
+    if provider_id == "custom":
+        try:
+            name = input_fn("Nome do provider: ").strip()
+            base_url = input_fn("Base URL (ex.: https://api.exemplo.com): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not name or not base_url.startswith(("http://", "https://")):
+            print(c.yellow("Nome ou URL inválidos; configuração cancelada."))
+            return None
+        provider_id = _safe_provider_id(name)
+        original = provider_id
+        n = 2
+        while provider_id in PROVIDER_PRESETS or provider_id in providers:
+            provider_id, n = f"{original}-{n}", n + 1
+        try:
+            api_format = input_fn(
+                "Formato [openai/anthropic/custom-paths] (padrão: openai): "
+            ).strip().lower() or "openai"
+        except (EOFError, KeyboardInterrupt):
+            api_format = "openai"
+        custom_spec = {"name": name, "base_url": base_url.rstrip("/"),
+                       "api_key": "", "model": None, "custom": True,
+                       "api_format": api_format}
+        if api_format in ("custom", "custom-paths"):
+            try:
+                custom_spec["chat_completions_path"] = input_fn(
+                    "Path de chat (padrão: /v1/chat/completions): "
+                ).strip() or "/v1/chat/completions"
+                custom_spec["models_path"] = input_fn(
+                    "Path de modelos (padrão: /v1/models): "
+                ).strip() or "/v1/models"
+            except (EOFError, KeyboardInterrupt):
+                custom_spec["chat_completions_path"] = "/v1/chat/completions"
+                custom_spec["models_path"] = "/v1/models"
+        providers[provider_id] = custom_spec
+    elif provider_id not in PROVIDER_PRESETS:
+        return None
+    preset = PROVIDER_PRESETS.get(provider_id, {})
+    if preset.get("needs_endpoint") and not providers.get(provider_id, {}).get("base_url"):
+        try:
+            endpoint = input_fn(
+                f"Endpoint de {preset['name']} ({preset['endpoint_hint']}): "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            endpoint = ""
+        if endpoint:
+            providers.setdefault(provider_id, {})["base_url"] = endpoint.rstrip("/")
+    spec = provider_spec(cfg, provider_id)
+    if not spec.get("local"):
+        env_name = spec.get("env_key", "")
+        if env_name and os.environ.get(env_name):
+            print(c.green(f"✅ Chave encontrada em {env_name}."))
+        elif not spec.get("api_key"):
+            try:
+                key = getpass.getpass(
+                    f"API key de {spec['name']} (Enter para configurar depois): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                key = ""
+            if key:
+                providers.setdefault(provider_id, {})["api_key"] = key
+    activate_provider(cfg, provider_id)
+    cfg["setup_complete"] = True
+    save_config(cfg)
+    return provider_id
+
+
+def first_run_setup(cfg, c):
+    """Assistente exibido apenas na primeira execução interativa."""
+    if cfg.get("setup_complete") or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    print()
+    panel("✨ PRIMEIRA CONFIGURAÇÃO",
+          "Escolha seu provider de IA. LM Studio e Ollama continuam sendo\n"
+          "detectados automaticamente e não exigem configuração.", c, width=72)
+    choices = [
+        "auto", "ollama", "lmstudio", "claude", "openai", "nvidia",
+        "gemini", "mistral", "groq", "cohere", "together", "perplexity",
+        "deepseek", "xai", "openrouter", "azure", "bedrock", "huggingface",
+        "custom",
+    ]
+    for i, pid in enumerate(choices, 1):
+        label = "Provider customizado (OpenAI/Anthropic/paths próprios)" if pid == "custom" \
+            else PROVIDER_PRESETS[pid]["name"]
+        print(f"  {i}. {label}")
+    try:
+        raw = input("Escolha [1]: ").strip() or "1"
+        idx = int(raw) - 1
+        provider_id = choices[idx]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        provider_id = "auto"
+    selected = configure_provider(cfg, provider_id, c)
+    if selected:
+        print(c.green(f"✅ Provider ativo: {provider_spec(cfg)['name']}"))
+        print(c.dim("   Use 'provider' para adicionar/trocar e 'model' para trocar o modelo."))
+    return bool(selected)
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
+    cfg["providers"] = {}
+    data = {}
     try:
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             cfg.update({k: v for k, v in data.items() if k in cfg})
+            # Configurações de versões anteriores já estavam prontas para uso.
+            if "setup_complete" not in data:
+                cfg["setup_complete"] = True
     except Exception:
         pass
+    if cfg.get("provider") != "auto" or cfg.get("providers"):
+        try:
+            activate_provider(cfg, cfg.get("provider", "auto"), remember_current=False)
+        except KeyError:
+            cfg["provider"] = "auto"
     if os.environ.get("SEND_BASE_URL"):
         cfg["base_url"] = os.environ["SEND_BASE_URL"].rstrip("/")
     if os.environ.get("SEND_MODEL"):
         cfg["model"] = os.environ["SEND_MODEL"]
-    if os.environ.get("SEND_API_KEY"):
-        cfg["api_key"] = os.environ["SEND_API_KEY"]
     return cfg
 
 
@@ -1313,6 +1566,15 @@ def _request(url, payload=None, api_key="", method="POST", timeout=30):
     req.add_header("Content-Type", "application/json")
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
+        # A camada OpenAI-compatible da Anthropic aceita o mesmo payload, mas
+        # clientes diretos também esperam estes cabeçalhos.
+        if "api.anthropic.com" in url:
+            req.add_header("x-api-key", api_key)
+            req.add_header("anthropic-version", "2023-06-01")
+        if ".openai.azure.com" in url:
+            req.add_header("api-key", api_key)
+        if "generativelanguage.googleapis.com" in url:
+            req.add_header("x-goog-api-key", api_key)
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -1337,33 +1599,52 @@ def stream_sse(url, payload, api_key=""):
 
 
 def list_models(base_url, api_key=""):
+    """Compatibilidade legada: consulta um endpoint OpenAI em `/v1/models`."""
     data = http_json(base_url + "/v1/models", api_key=api_key, method="GET")
+    return _model_ids(data)
+
+
+def _model_ids(data):
     out = []
-    for m in data.get("data", []):
-        mid = m.get("id") or m.get("name") or ""
+    for m in data.get("data", data.get("models", [])):
+        if isinstance(m, str):
+            mid = m
+        else:
+            mid = m.get("id") or m.get("name") or ""
+            if mid.startswith("models/"):
+                mid = mid.split("/", 1)[1]
         if mid:
             out.append(mid)
     return out
 
 
+def list_provider_models(cfg):
+    data = http_json(provider_api_url(cfg, "models"),
+                     api_key=provider_api_key(cfg), method="GET")
+    return _model_ids(data)
+
+
 def resolve_model(cfg, c):
-    """Retorna o id do modelo: o configurado ou o primeiro do LM Studio."""
+    """Retorna o modelo configurado ou o primeiro oferecido pelo provider."""
     if cfg.get("model"):
         return cfg["model"]
+    spec = provider_spec(cfg)
     try:
-        models = list_models(cfg["base_url"], cfg["api_key"])
+        models = list_provider_models(cfg)
     except urllib.error.URLError as e:
+        local_hint = ("\n  ➜ Inicie o LM Studio ou Ollama e carregue um modelo."
+                      if spec.get("local") else
+                      "\n  ➜ Verifique a URL, a conexão e a API key do provider.")
         raise ConnectionError(
-            f"Não consegui conectar ao LM Studio em {cfg['base_url']} ({e.reason}).\n"
-            "  ➜ Abra o LM Studio, carregue um modelo e clique em "
-            "'Developer' → 'Start Server' (porta 1234)."
+            f"Não consegui conectar a {spec['name']} em {cfg['base_url']} "
+            f"({e.reason}).{local_hint}"
         )
     except Exception as e:
-        raise ConnectionError(f"Erro ao consultar o LM Studio em {cfg['base_url']}: {e}")
+        raise ConnectionError(f"Erro ao consultar {spec['name']} em {cfg['base_url']}: {e}")
     if not models:
         raise ConnectionError(
-            "O LM Studio respondeu, mas nenhum modelo está carregado.\n"
-            "  ➜ Carregue um modelo no LM Studio e tente de novo."
+            f"{spec['name']} respondeu, mas não informou nenhum modelo.\n"
+            "  ➜ Use 'model <id>' para definir um modelo manualmente."
         )
     return models[0]
 
@@ -2663,6 +2944,50 @@ def summarize_conversation(sess, c):
     return True
 
 
+def _anthropic_payload(payload):
+    """Converte mensagens e tools OpenAI para a API Messages da Anthropic."""
+    converted = {
+        "model": payload["model"], "stream": True, "max_tokens": 8192,
+        "temperature": payload.get("temperature", 0.7), "messages": [],
+    }
+    for msg in payload["messages"]:
+        role = msg.get("role")
+        if role == "system":
+            converted["system"] = msg.get("content") or ""
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            blocks = []
+            if msg.get("content"):
+                blocks.append({"type": "text", "text": msg["content"]})
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                try:
+                    args = json.loads(fn.get("arguments") or "{}")
+                except Exception:
+                    args = {"_raw": fn.get("arguments", "")}
+                blocks.append({"type": "tool_use", "id": tc.get("id"),
+                               "name": fn.get("name"), "input": args})
+            converted["messages"].append({"role": "assistant", "content": blocks})
+        elif role == "tool":
+            converted["messages"].append({
+                "role": "user", "content": [{"type": "tool_result",
+                "tool_use_id": msg.get("tool_call_id"),
+                "content": str(msg.get("content") or "")}],
+            })
+        elif role in ("user", "assistant"):
+            converted["messages"].append(
+                {"role": role, "content": msg.get("content") or ""}
+            )
+    if payload.get("tools"):
+        converted["tools"] = [{
+            "name": tool["function"]["name"],
+            "description": tool["function"].get("description", ""),
+            "input_schema": tool["function"].get("parameters", {"type": "object"}),
+        } for tool in payload["tools"]]
+        converted["tool_choice"] = {"type": "auto"}
+    return converted
+
+
 def call_model(sess, tools_enabled, c, cfg):
     """Chama a API com streaming. Retorna (conteúdo, tool_calls, reasoning)."""
     if sess.model_id is None:
@@ -2692,8 +3017,13 @@ def call_model(sess, tools_enabled, c, cfg):
     if cfg["thinking"]:
         payload["reasoning_effort"] = cfg["reasoning_effort"]
 
+    spec = provider_spec(cfg)
+    api_format = spec.get("api_format", "openai")
+    request_payload = _anthropic_payload(payload) if api_format == "anthropic" else payload
+    endpoint = "messages" if api_format == "anthropic" else "chat/completions"
     try:
-        stream = stream_sse(cfg["base_url"] + "/v1/chat/completions", payload, cfg["api_key"])
+        stream = stream_sse(provider_api_url(cfg, endpoint), request_payload,
+                            provider_api_key(cfg))
         return _consume_stream(stream, c, cfg)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -2706,8 +3036,10 @@ def call_model(sess, tools_enabled, c, cfg):
             ))
             cfg["thinking"] = False
             payload.pop("reasoning_effort", None)
-            stream = stream_sse(cfg["base_url"] + "/v1/chat/completions",
-                                payload, cfg["api_key"])
+            request_payload = (_anthropic_payload(payload)
+                               if api_format == "anthropic" else payload)
+            stream = stream_sse(provider_api_url(cfg, endpoint),
+                                request_payload, provider_api_key(cfg))
             return _consume_stream(stream, c, cfg)
         raise
 
@@ -2727,6 +3059,38 @@ def _consume_stream(stream, c, cfg):
             try:
                 evt = json.loads(raw)
             except Exception:
+                continue
+            # API Messages nativa (Claude e custom providers Anthropic).
+            event_type = evt.get("type", "")
+            if event_type == "content_block_start":
+                block = evt.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    idx = evt.get("index", len(order))
+                    tool_calls[idx] = {
+                        "id": block.get("id", ""),
+                        "function": {"name": block.get("name", ""),
+                                     "arguments": (json.dumps(block.get("input"))
+                                                   if block.get("input") else "")},
+                    }
+                    order.append(idx)
+                continue
+            if event_type == "content_block_delta":
+                delta = evt.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    piece = delta.get("text", "")
+                    content_parts.append(piece)
+                    printer.write(piece)
+                    sys.stdout.flush()
+                elif delta.get("type") in ("thinking_delta", "signature_delta"):
+                    piece = delta.get("thinking", "")
+                    if piece and cfg["show_reasoning"]:
+                        reasoning_parts.append(piece)
+                elif delta.get("type") == "input_json_delta":
+                    idx = evt.get("index", 0)
+                    if idx in tool_calls:
+                        tool_calls[idx]["function"]["arguments"] += delta.get(
+                            "partial_json", ""
+                        )
                 continue
             for ch in evt.get("choices", []):
                 delta = ch.get("delta", {}) or {}
@@ -3140,8 +3504,9 @@ COMMANDS = [
     ("/pensamento", "/pensamento", "Mostra o último pensamento do modelo (expandido)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
-    ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
-    ("/models", "/models", "Lista os modelos carregados no servidor", "modelo"),
+    ("/provider", "/provider [nome|add]", "Adiciona ou troca o provider de IA", "modelo"),
+    ("/model", "/model [nome]", "Lista ou troca o modelo do provider atual", "modelo"),
+    ("/models", "/models", "Lista os modelos do provider atual", "modelo"),
     ("/thinking", "/thinking [on|off]", "Liga/desliga o pensamento do modelo", "modelo"),
     ("/backend", "/backend [lmstudio|ollama|url]", "Mostra ou troca o servidor (LM Studio / Ollama)", "modelo"),
     ("/code", "/code", "Modo coding: usa as skills (arquivos, terminal, internet, pc)", "modo"),
@@ -3168,7 +3533,7 @@ COMMAND_CATEGORIES = ["básico", "modelo", "modo", "sessão", "sistema"]
 
 
 def build_help_text():
-    lines = ["Comandos do SEND — digite / e Enter para abrir a paleta:", ""]
+    lines = ["Comandos do SEND — digite / para abrir a paleta:", ""]
     for cat in COMMAND_CATEGORIES:
         lines.append(f"  {cat.upper()}:")
         for name, syntax, desc, ccat in COMMANDS:
@@ -3176,7 +3541,7 @@ def build_help_text():
                 lines.append(f"    {syntax:<36} {desc}")
         lines.append("")
     lines.append("Dicas:")
-    lines.append("  • digite / e Enter → paleta de comandos interativa")
+    lines.append("  • digite / → paleta de comandos interativa")
     lines.append("  • Tab completa comandos que começam com /")
     lines.append("  • use \\ no fim da linha para continuar em outra linha")
     lines.append("  • Ctrl+C interrompe a resposta; Ctrl+C de novo sai")
@@ -3189,7 +3554,7 @@ HELP_TEXT = build_help_text()
 def print_help(c):
     """Ajuda bonita, organizada por categoria com cores."""
     print()
-    panel("⚡ SEND — AJUDA", "digite / + Enter para a paleta interativa "
+    panel("⚡ SEND — AJUDA", "digite / para a paleta interativa "
           "(com busca)", c, width=74)
     for cat, cmds in _command_groups():
         if not cmds:
@@ -3201,7 +3566,7 @@ def print_help(c):
             print(f"    {c.bold(syn)} {c.dim(desc)}")
     print()
     print(c.bold(c.magenta("  DICAS")))
-    print(c.dim("    • digite / + Enter → paleta interativa (digite para "
+    print(c.dim("    • digite / → paleta interativa (digite para "
                 "filtrar, ↑↓, Enter)"))
     print(c.dim("    • Tab completa comandos e caminhos de arquivos"))
     print(c.dim("    • use \\ no fim da linha para continuar em outra linha"))
@@ -3239,7 +3604,7 @@ def _command_groups():
             for cat in COMMAND_CATEGORIES]
 
 
-def _menu_fallback(c):
+def _menu_fallback(c, initial_query=""):
     """Paleta numerada para Windows / terminal não-interativo."""
     print()
     panel("⚡ COMANDOS DO SEND",
@@ -3252,6 +3617,9 @@ def _menu_fallback(c):
             continue
         print(c.bold(c.magenta("  ◆ " + cat.upper())))
         for name, syntax, desc in cmds:
+            query = initial_query.lower().lstrip("/")
+            if query and not name.lower().lstrip("/").startswith(query):
+                continue
             syn = syntax[:34].ljust(34)
             print(f"   {n:>2}. {c.bold(syn)} {c.dim(desc)}")
             nums.append((n, name))
@@ -3270,14 +3638,13 @@ def _menu_fallback(c):
     return None
 
 
-def show_command_menu(c):
-    """Paleta de comandos interativa: digite para filtrar, ↑↓ navega,
-    Enter executa, Esc/q fecha. Retorna o comando ou None se cancelado."""
+def show_command_menu(c, initial_query=""):
+    """Paleta incremental: filtra enquanto digita e aceita ↑/↓, Tab ou Enter."""
     groups = _command_groups()
 
     # Fallback para Windows/sem TTY: lista numerada
     if os.name == "nt" or not sys.stdin.isatty():
-        return _menu_fallback(c)
+        return _menu_fallback(c, initial_query)
 
     import select
     import termios
@@ -3286,9 +3653,13 @@ def show_command_menu(c):
     def matches(query, name, syntax, desc):
         if not query:
             return True
-        q = query.strip().lower()
+        q = query.strip().lower().lstrip("/")
+        # O nome recebe prioridade: `p` sugere /provider, /plan etc. A busca
+        # por palavras na descrição continua útil para consultas mais longas.
+        if name.lower().lstrip("/").startswith(q):
+            return True
         hay = f"{name} {syntax} {desc}".lower()
-        return all(part in hay for part in q.split())
+        return len(q) > 1 and all(part in hay for part in q.split())
 
     def build(query):
         items = []  # ("cat", nome) ou ("cmd", nome, sintaxe, desc)
@@ -3348,12 +3719,12 @@ def show_command_menu(c):
         old = termios.tcgetattr(fd)
     except Exception:
         # terminal sem termios (ex.: alguns emuladores/ssh) → fallback numerado
-        return _menu_fallback(c)
+        return _menu_fallback(c, initial_query)
     size = shutil.get_terminal_size((100, 24))
     width = max(60, min(140, size.columns))
     maxh = max(6, size.lines - 8)
 
-    query = ""
+    query = initial_query.lstrip("/")
     items = build(query)
     sel = 0
     while items and items[sel][0] != "cmd":
@@ -3371,7 +3742,7 @@ def show_command_menu(c):
             ch = sys.stdin.read(1)
             if ch in ("q", "Q", "\x03"):
                 break
-            if ch == "\r":
+            if ch in ("\r", "\t"):
                 if items and items[sel][0] == "cmd":
                     name = items[sel][1]
                     sys.stdout.write("\r\n")
@@ -3470,8 +3841,10 @@ def cmd_config(sess, rest, c, tools_enabled):
     if not parts:
         lines = []
         for k, v in cfg.items():
-            if k == "skills":
+            if k in ("skills", "providers"):
                 continue
+            if k == "api_key" and v:
+                v = "••••••••"
             mark = "" if k in EDITABLE_CONFIG else c.dim(" (fixa)")
             lines.append(f"{k:<18} = {v}{mark}")
         lines.append("")
@@ -3495,8 +3868,16 @@ def cmd_config(sess, rest, c, tools_enabled):
         print(c.yellow(f"Valor inválido para {key}: {raw!r}"))
         return False, tools_enabled
     cfg[key] = value
+    if key in ("base_url", "api_key", "model"):
+        active = cfg.setdefault("providers", {}).setdefault(
+            cfg.get("provider", "auto"), {}
+        )
+        active[key] = value
+        if key == "base_url":
+            cfg["auto_backend"] = False
     save_config(cfg)
-    print(f"✅ {key} = {value}")
+    shown = "••••••••" if key == "api_key" and value else value
+    print(f"✅ {key} = {shown}")
     return False, tools_enabled
 
 
@@ -3527,6 +3908,86 @@ def cmd_backups(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+def cmd_provider(sess, rest, c, tools_enabled):
+    """Lista, adiciona ou troca o provider da sessão."""
+    cfg = sess.cfg
+    configured = cfg.get("providers", {})
+    if not rest:
+        print(f"Provider atual: {provider_spec(cfg)['name']} ({cfg.get('provider', 'auto')})")
+        print("Disponíveis:")
+        ids = list(PROVIDER_PRESETS)
+        for pid in ids:
+            mark = " ← atual" if pid == cfg.get("provider") else ""
+            ready = ("local/automático" if PROVIDER_PRESETS[pid].get("local") else
+                     ("configurado" if pid in configured or
+                      os.environ.get(PROVIDER_PRESETS[pid].get("env_key", "")) else
+                      "requer API key"))
+            print(f"  • {pid:<12} {PROVIDER_PRESETS[pid]['name']} [{ready}]{mark}")
+        for pid, spec in configured.items():
+            if pid not in PROVIDER_PRESETS:
+                mark = " ← atual" if pid == cfg.get("provider") else ""
+                print(f"  • {pid:<12} {spec.get('name', pid)} [customizado]{mark}")
+        print("Use: provider <nome> | provider add | provider custom")
+        return False, tools_enabled
+
+    arg = rest.strip().lower()
+    if arg.startswith("add "):
+        arg = arg[4:].strip()
+    if arg in ("add", "custom", "novo"):
+        arg = "custom"
+    if arg not in PROVIDER_PRESETS and arg not in configured and arg != "custom":
+        print(c.yellow(f"Provider desconhecido: {arg}. Use /provider para listar."))
+        return False, tools_enabled
+    selected = configure_provider(cfg, arg, c)
+    if not selected:
+        return False, tools_enabled
+    sess.model_id = None
+    spec = provider_spec(cfg)
+    key = provider_api_key(cfg, spec)
+    if not spec.get("local") and not key:
+        env_name = spec.get("env_key")
+        hint = f" ou defina {env_name}" if env_name else ""
+        print(c.yellow(f"⚠ API key ainda não configurada{hint}."))
+    print(c.green(f"✅ Provider ativo: {spec['name']} ({cfg['base_url']})"))
+    return False, tools_enabled
+
+
+def cmd_model(sess, rest, c, tools_enabled):
+    """Lista os modelos do provider atual e permite trocar o selecionado."""
+    cfg = sess.cfg
+    try:
+        models = list_provider_models(cfg)
+    except Exception as e:
+        models = []
+        if not rest:
+            print(c.yellow(f"⚠ Não foi possível listar modelos: {e}"))
+    name = rest.strip()
+    if not name:
+        current = sess.model_id or cfg.get("model") or "auto"
+        print(f"Modelo atual em {provider_spec(cfg)['name']}: {current}")
+        for i, model_id in enumerate(models, 1):
+            mark = " ← atual" if model_id == current else ""
+            print(f"  {i}. {model_id}{mark}")
+        if models and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                raw = input("Escolha um número (Enter cancela): ").strip()
+                if raw:
+                    name = models[int(raw) - 1]
+            except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+                return False, tools_enabled
+        if not name:
+            return False, tools_enabled
+    if models and name not in models:
+        print(c.yellow(f"⚠ '{name}' não aparece na lista do provider. "
+                       "O ID será usado mesmo assim."))
+    cfg["model"] = name
+    cfg.setdefault("providers", {}).setdefault(cfg.get("provider", "auto"), {})["model"] = name
+    sess.model_id = name
+    save_config(cfg)
+    print(f"✅ Modelo definido: {name}")
+    return False, tools_enabled
+
+
 def cmd_backend(sess, rest, c, tools_enabled):
     cfg = sess.cfg
     if not rest:
@@ -3535,17 +3996,19 @@ def cmd_backend(sess, rest, c, tools_enabled):
         print("  Troque com: /backend lmstudio | ollama | <url>")
         return False, tools_enabled
     arg = rest.strip().lower()
-    if arg == "lmstudio":
-        url = DEFAULT_BASE_URL
-    elif arg == "ollama":
-        url = OLLAMA_URL
+    if arg in ("lmstudio", "ollama"):
+        activate_provider(cfg, arg)
     elif arg.startswith("http://") or arg.startswith("https://"):
-        url = arg
+        pid = "backend-custom"
+        cfg.setdefault("providers", {})[pid] = {
+            "name": "Backend customizado", "base_url": arg.rstrip("/"),
+            "api_key": cfg.get("api_key", ""), "model": None, "custom": True,
+        }
+        activate_provider(cfg, pid)
     else:
         print(c.yellow("Use: /backend lmstudio | ollama | <url>"))
         return False, tools_enabled
-    cfg["base_url"] = url.rstrip("/")
-    cfg["auto_backend"] = False
+    cfg["setup_complete"] = True
     save_config(cfg)
     sess.model_id = None  # força re-detecção do modelo no novo servidor
     print(f"✅ Servidor: {cfg['base_url']}")
@@ -3752,32 +4215,17 @@ def handle_command(sess, line, c, tools_enabled):
         sess.messages = []
         print("🧹 Conversa limpa.")
         return False, tools_enabled
+    if cmd == "/provider":
+        return cmd_provider(sess, rest, c, tools_enabled)
     if cmd == "/model":
-        if not rest:
-            print(f"Modelo atual: {sess.model_id or cfg['model'] or 'auto'}")
-        else:
-            name = rest
-            try:
-                available = list_models(cfg["base_url"], cfg["api_key"])
-                if available and name not in available:
-                    print(c.yellow(
-                        f"⚠ '{name}' não está carregado no LM Studio. "
-                        f"Disponíveis: {', '.join(available)}"
-                    ))
-            except Exception:
-                pass
-            cfg["model"] = name
-            sess.model_id = name
-            save_config(cfg)
-            print(f"✅ Modelo definido: {name}")
-        return False, tools_enabled
+        return cmd_model(sess, rest, c, tools_enabled)
     if cmd == "/models":
         try:
-            models = list_models(cfg["base_url"], cfg["api_key"])
+            models = list_provider_models(cfg)
             if not models:
-                print(c.yellow("⚠ Nenhum modelo carregado no LM Studio."))
+                print(c.yellow(f"⚠ Nenhum modelo informado por {provider_spec(cfg)['name']}."))
             else:
-                print(f"Modelos em {cfg['base_url']}:")
+                print(f"Modelos de {provider_spec(cfg)['name']} em {cfg['base_url']}:")
                 for m in models:
                     mark = " ← atual" if m == (sess.model_id or cfg["model"]) else ""
                     print(f"  • {m}{mark}")
@@ -3920,6 +4368,7 @@ def handle_command(sess, line, c, tools_enabled):
     if cmd == "/status":
         skills = cfg.get("skills", SKILL_ORDER)
         lines = [
+            f"Provider     : {provider_spec(cfg)['name']} ({cfg.get('provider', 'auto')})",
             f"Servidor     : {cfg['base_url']}",
             f"Modelo       : {sess.model_id or cfg['model'] or 'auto'}",
             f"Modo         : {cfg['mode']}",
@@ -3982,10 +4431,67 @@ def _command_completer(text, state):
     return None
 
 
+def _input_with_instant_palette(prompt, c):
+    """Lê a primeira tecla e abre a paleta imediatamente quando ela é `/`.
+
+    Para qualquer outro caractere, devolve o controle ao GNU readline com a
+    tecla já inserida, preservando edição, histórico e autocomplete normais.
+    """
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        return input(prompt)
+    visible_prompt = prompt.replace("\001", "").replace("\002", "")
+    sys.stdout.write(visible_prompt)
+    sys.stdout.flush()
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    if ch == "/":
+        sys.stdout.write("/\r\n")
+        sys.stdout.flush()
+        return show_command_menu(c)
+    if ch == "\x03":
+        raise KeyboardInterrupt
+    if ch == "\x04":
+        sys.stdout.write("\r\n")
+        return None
+
+    # Limpa o prompt desenhado no modo raw e deixa readline redesenhá-lo.
+    sys.stdout.write("\r\x1b[2K")
+    sys.stdout.flush()
+    initial = ch if ch.isprintable() else ""
+
+    def insert_initial():
+        if initial:
+            readline.insert_text(initial)
+            readline.redisplay()
+
+    readline.set_startup_hook(insert_initial)
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+    finally:
+        readline.set_startup_hook(None)
+
+
 def read_input(prompt, c):
     try:
-        line = input(prompt)
+        if (readline and os.name != "nt" and sys.stdin.isatty()
+                and sys.stdout.isatty()):
+            line = _input_with_instant_palette(prompt, c)
+        else:
+            line = input(prompt)
     except EOFError:
+        return None
+    if line is None:
         return None
     while line.rstrip().endswith("\\"):
         line = line.rstrip()[:-1]
@@ -4054,6 +4560,22 @@ def repl(sess, c, tools_enabled):
             if not choice:
                 continue
             line = choice
+        elif line.startswith("/"):
+            command_token = line.split()[0].lower()
+            known = {name for name, *_ in COMMANDS}
+            # `/p`, `/mo` etc. abrem a mesma paleta já filtrada. No terminal,
+            # a busca segue incrementalmente e Tab/Enter aceita a seleção.
+            if command_token not in known:
+                choice = show_command_menu(c, initial_query=command_token)
+                if not choice:
+                    continue
+                line = choice
+        # Os dois comandos de configuração também funcionam sem a barra, como
+        # documentado no onboarding (as versões /provider e /model permanecem).
+        if line == "provider" or line.startswith("provider "):
+            line = "/" + line
+        elif line == "model" or line.startswith("model "):
+            line = "/" + line
         if line.startswith("/"):
             do_exit, tools_enabled = handle_command(sess, line, c, tools_enabled)
             if do_exit:
@@ -4076,7 +4598,7 @@ def repl(sess, c, tools_enabled):
                 run_workflow(sess, line, c, cfg)
             except urllib.error.URLError as e:
                 nice_error(c, "Servidor offline",
-                           f"{cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                           f"{cfg['base_url']} — o provider está acessível?\n"
                            "Rode 'send --doctor' para diagnosticar.")
             except urllib.error.HTTPError as e:
                 print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
@@ -4099,7 +4621,7 @@ def repl(sess, c, tools_enabled):
                                 getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         except urllib.error.URLError as e:
             nice_error(c, "Servidor offline",
-                       f"{cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                       f"{cfg['base_url']} — o provider está acessível?\n"
                        "Rode 'send --doctor' para diagnosticar.")
         except urllib.error.HTTPError as e:
             print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
@@ -4152,7 +4674,7 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
             run_workflow(sess, prompt, c, sess.cfg)
         except urllib.error.URLError as e:
             nice_error(c, "Servidor offline",
-                       f"{sess.cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                       f"{sess.cfg['base_url']} — o provider está acessível?\n"
                        "Rode 'send --doctor' para diagnosticar.")
             return 2
         except urllib.error.HTTPError as e:
@@ -4178,7 +4700,7 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
                             c, auto_confirm)
     except urllib.error.URLError as e:
         nice_error(c, "Servidor offline",
-                   f"{sess.cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                   f"{sess.cfg['base_url']} — o provider está acessível?\n"
                    "Rode 'send --doctor' para diagnosticar.")
         return 2
     except urllib.error.HTTPError as e:
@@ -4220,7 +4742,7 @@ def doctor(cfg, c):
     small("Testando conexão", cfg["base_url"], c)
     t0 = time.time()
     try:
-        models = list_models(cfg["base_url"], cfg["api_key"])
+        models = list_provider_models(cfg)
         dt = (time.time() - t0) * 1000
         print(c.green(f"  ✅ Conexão OK em {dt:.0f} ms"))
         if models:
@@ -4228,17 +4750,20 @@ def doctor(cfg, c):
             for m in models:
                 print(f"    • {m}")
             return 0
-        print(c.yellow("  ⚠ Servidor respondeu, mas nenhum modelo está carregado."))
-        print(c.yellow("     Carregue um modelo no LM Studio e tente de novo."))
+        print(c.yellow("  ⚠ O provider respondeu, mas não informou modelos."))
+        print(c.yellow("     Use /model <id> para definir um modelo manualmente."))
         return 1
     except urllib.error.URLError as e:
+        spec = provider_spec(cfg)
+        if spec.get("local"):
+            steps = ("Inicie o LM Studio ou Ollama, carregue um modelo e "
+                     "confirme que o servidor local está ativo.")
+        else:
+            steps = ("Verifique o endpoint, a conexão e a API key. "
+                     "Use /provider para reconfigurar.")
         nice_error(c, "Não foi possível conectar",
-                   f"{cfg['base_url']} ({e.reason})\n\n"
-                   "Como resolver:\n"
-                   "  1. Abra o LM Studio e carregue um modelo (ex.: Qwen2.5 Coder 7B)\n"
-                   "  2. Clique na aba 'Developer' (Servidor Local) → 'Start Server'\n"
-                   "  3. Confirme que a porta é 1234\n"
-                   "  4. Rode 'send --doctor' novamente")
+                   f"{cfg['base_url']} ({e.reason})\n\nComo resolver:\n  {steps}\n"
+                   "  Rode 'send --doctor' novamente.")
         return 1
     except Exception as e:
         print(c.red(f"  ✗ Erro: {e}"))
@@ -4307,7 +4832,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog="send",
         description="SEND — assistente de IA no terminal (estilo Claude Code), "
-                    "conectado ao LM Studio (http://127.0.0.1:1234).",
+                    "com providers locais, de nuvem ou customizados.",
         epilog="Exemplos:\n"
                "  send                          modo interativo\n"
                "  send \"explique este código\"   resposta única\n"
@@ -4320,7 +4845,7 @@ def parse_args(argv=None):
     ap.add_argument("prompt", nargs="*", help="prompt para execução única "
                     "(se omitido, abre o modo interativo)")
     ap.add_argument("-m", "--model", help="ID do modelo (padrão: primeiro "
-                    "modelo carregado no LM Studio)")
+                    "modelo disponível no provider)")
     ap.add_argument("-u", "--base-url", default=None,
                     help=f"URL do servidor (padrão: {DEFAULT_BASE_URL})")
     ap.add_argument("-c", "--code", action="store_true",
@@ -4357,9 +4882,9 @@ def parse_args(argv=None):
     ap.add_argument("--temperature", type=float,
                     help="temperatura do modelo (padrão: 0.7)")
     ap.add_argument("--models", action="store_true",
-                    help="lista os modelos disponíveis no LM Studio e sai")
+                    help="lista os modelos disponíveis no provider e sai")
     ap.add_argument("--doctor", action="store_true",
-                    help="diagnostica a instalação e a conexão com o LM Studio")
+                    help="diagnostica a instalação e a conexão com o provider")
     ap.add_argument("--update", action="store_true",
                     help="atualiza o SEND para a versão mais recente")
     ap.add_argument("--install", action="store_true",
@@ -4384,6 +4909,8 @@ def main(argv=None):
         return self_update(c)
 
     cfg = load_config()
+    if not args.base_url and not args.doctor and not args.models:
+        first_run_setup(cfg, c)
     if args.base_url:
         cfg["base_url"] = args.base_url.rstrip("/")
     if args.model:
@@ -4414,7 +4941,7 @@ def main(argv=None):
 
     if args.models:
         try:
-            models = list_models(cfg["base_url"], cfg["api_key"])
+            models = list_provider_models(cfg)
             if not models:
                 print(c.yellow("⚠ Nenhum modelo carregado no LM Studio."))
                 return 1

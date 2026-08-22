@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.7.0 — assistente de IA no terminal (LM Studio)
+⚡ SEND v1.8.0 — assistente de IA no terminal (local ou na nuvem)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -125,10 +125,44 @@ Quando o modelo escreve código, o SEND pergunta se quer **salvar no disco**:
 send --save-code "crie um script que ordene uma lista"   # salva sozinho
 ```
 
+## 🔌 Providers de IA e configuração inicial
+
+Na primeira execução interativa, o SEND pergunta qual provider você deseja usar.
+A lista inclui **Ollama, LM Studio, Claude (Anthropic), OpenAI, NVIDIA NIM,
+Google Gemini, Mistral AI, Groq, Cohere, Together AI, Perplexity, DeepSeek,
+xAI (Grok), OpenRouter, Azure OpenAI, AWS Bedrock e Hugging Face Inference**.
+Também é possível cadastrar qualquer provider customizado, informando nome,
+endpoint, API key e paths próprios. Os formatos OpenAI-compatible e Anthropic
+Messages são suportados; endpoints OpenAI-compatible funcionam sem adaptação.
+
+A chave pode ser informada no assistente ou pela variável de ambiente indicada
+pelo serviço, como `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`NVIDIA_API_KEY`, `COHERE_API_KEY`, `TOGETHER_API_KEY`, `XAI_API_KEY` ou
+`HF_TOKEN`. Variáveis de ambiente não são copiadas para o `config.json`.
+
+Dois comandos ficam disponíveis durante toda a sessão, com ou sem `/`:
+
+```text
+provider                 # lista providers e mostra o atual
+provider openai          # adiciona/ativa um preset
+provider add             # cria um provider customizado
+model                    # lista modelos do provider atual e permite escolher
+model gpt-5              # troca diretamente pelo ID
+```
+
+### Paleta e autocomplete de comandos
+
+Digite `/` para abrir a paleta. Continue digitando para filtrar (`/p` sugere
+`/provider`; `/m` sugere `/model`), navegue com **↑/↓** e complete a seleção
+com **Tab** ou **Enter**. O Tab do prompt também completa nomes de comandos.
+`/help` exibe a lista completa com uma descrição breve de cada comando.
+
 ## 🔄 Backend automático: LM Studio **ou** Ollama
 
-O SEND tenta o LM Studio (`http://127.0.0.1:1234`) primeiro; se não estiver
-rodando, **detecta sozinho o Ollama** (`http://127.0.0.1:11434`) e avisa.
+A opção padrão continua totalmente automática: o SEND tenta o LM Studio
+(`http://127.0.0.1:1234`) primeiro; se não estiver rodando, **detecta sozinho o
+Ollama** (`http://127.0.0.1:11434`) e avisa. Nenhuma chave ou configuração é
+necessária para esses providers locais.
 Para trocar manualmente:
 
 ```
@@ -491,7 +525,8 @@ autocompletar comandos.
 
 ```
 /help     /skills [nome] [on|off]   /memoria   /resumo   /pensamento   /clear   /exit
-/model [nome]   /models   /thinking on|off   /backend [lmstudio|ollama|url]
+/provider [nome|add]   /model [nome]   /models   /thinking on|off
+/backend [lmstudio|ollama|url]
 /code     /chat   /plan   /workflow   /tools on|off
 /automode [on|off]   /outmode [on|off]
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
