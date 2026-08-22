@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -4867,77 +4867,231 @@ def _command_completer(text, state):
     return None
 
 
-def _input_with_instant_palette(prompt, c):
-    """Lê a primeira tecla e abre a paleta imediatamente quando ela é `/`.
+def _inline_matches(query):
+    """Retorna lista de comandos que casam com query (para autocomplete inline)."""
+    if not query:
+        return []
+    q = query.strip().lower().lstrip("/")
+    groups = _command_groups()
+    out = []
+    for cat, cmds in groups:
+        for name, syntax, desc in cmds:
+            # mesmo critério do show_command_menu
+            if not q:
+                out.append((name, syntax, desc))
+            elif name.lower().lstrip("/").startswith(q):
+                out.append((name, syntax, desc))
+            elif len(q) > 1 and all(part in f"{name} {syntax} {desc}".lower() for part in q.split()):
+                out.append((name, syntax, desc))
+    return out[:6]  # mini barra: máximo 6 sugestões
 
-    Para qualquer outro caractere, devolve o controle ao GNU readline com a
-    tecla já inserida, preservando edição, histórico e autocomplete normais.
+
+def _draw_inline_box(matches, selected, width):
+    """Desenha mini barra inline tipo Claude Code (acima do prompt)."""
+    if not matches:
+        return []
+    lines = []
+    # borda superior sutil
+    lines.append("  \x1b[2m┌─ autocomplete ─────────────────────\x1b[0m")
+    for i, (name, syntax, desc) in enumerate(matches):
+        syn = syntax[:34].ljust(34)
+        d = desc[: max(10, width - 50)]
+        if i == selected:
+            # destaque invertido
+            lines.append(f"\x1b[48;5;26;1m ❯ {syn} {d}\x1b[0m")
+        else:
+            lines.append(f"   {syn} \x1b[2m{d}\x1b[0m")
+    lines.append("  \x1b[2m└─ ↑↓ navegar · Tab completar · Enter selecionar · Esc fechar\x1b[0m")
+    return lines
+
+
+def _input_with_inline_autocomplete(prompt, c):
+    """Input com autocomplete inline tipo Claude Code (mini barra segue o prompt).
+
+    Quando você digita '/' a mini barra aparece logo acima do prompt e filtra
+    enquanto você escreve, sem sair da linha. Você continua digitando no mesmo
+    lugar, não vai para outra janela.
+    Para qualquer outro texto sem '/', comportamento normal com histórico readline.
     """
     import termios
     import tty
+    import shutil
 
     fd = sys.stdin.fileno()
     try:
         old = termios.tcgetattr(fd)
     except Exception:
         return input(prompt)
+
     visible_prompt = prompt.replace("\001", "").replace("\002", "")
+    # tamanho do terminal para desenhar box
+    try:
+        width = shutil.get_terminal_size((100, 24)).columns
+    except Exception:
+        width = 100
+
+    buf = ""
+    selected = 0
+    prev_box_lines = 0
+
+    def _redraw():
+        nonlocal prev_box_lines
+        # limpa box anterior + linha do prompt
+        if prev_box_lines:
+            sys.stdout.write(f"\x1b[{prev_box_lines + 1}A")  # sobe box+prompt
+            sys.stdout.write("\x1b[J")  # limpa abaixo
+        else:
+            sys.stdout.write("\r\x1b[2K")  # só limpa linha atual
+        # desenha box se buf começa com /
+        box = []
+        if buf.startswith("/"):
+            q = buf.split()[0]  # só o token do comando
+            matches = _inline_matches(q)
+            if matches:
+                # ajusta selected dentro do range
+                nonlocal_selected = max(0, min(selected, len(matches) - 1))
+                box = _draw_inline_box(matches, nonlocal_selected, width)
+        # escreve box + prompt + buffer
+        if box:
+            sys.stdout.write("\r\n".join(box) + "\r\n")
+            prev_box_lines = len(box)
+        else:
+            prev_box_lines = 0
+        sys.stdout.write(visible_prompt + buf)
+        # posiciona cursor no fim do buffer (simples)
+        sys.stdout.flush()
+
     sys.stdout.write(visible_prompt)
     sys.stdout.flush()
     try:
         tty.setraw(fd)
-        try:
-            ch = os.read(fd, 1).decode(errors="ignore")
-        except OSError:
-            ch = ""
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    if ch == "/":
-        sys.stdout.write("/\r\n")
-        sys.stdout.flush()
-        # Coleta digitação rápida após / (ex: /help digitado sem pausa) para já abrir filtrado — grátis
-        initial = ""
-        try:
-            import select as _sel
-            for _ in range(16):
-                nxt = _read_nonblock(fd)
-                if nxt is None:
-                    _sel.select([sys.stdin], [], [], 0.03)
-                    nxt = _read_nonblock(fd)
-                if nxt is None:
-                    break
-                if nxt in ("\r", "\n", "\x1b", "\x7f", "\x08"):
-                    break
-                if nxt.isprintable():
-                    initial += nxt
+        while True:
+            try:
+                ch = os.read(fd, 1).decode(errors="ignore")
+            except OSError:
+                ch = ""
+            if not ch:
+                continue
+            # Ctrl+C
+            if ch == "\x03":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+            # Enter
+            if ch in ("\r", "\n"):
+                # se tem autocomplete ativo e um selecionado, completa?
+                # Para inline, Enter confirma o buffer atual (se for comando conhecido, o repl vai tratar)
+                # Se o buffer é só "/" e tem seleção, completa para o selecionado
+                if buf.startswith("/") and _inline_matches(buf.split()[0]):
+                    matches = _inline_matches(buf.split()[0])
+                    if matches:
+                        # se buf é só prefixo e há seleção, Tab/Enter completa para o comando
+                        # mas Enter sem Tab deve enviar o que está no buffer (ex: /help)
+                        # só auto-completa se buffer ainda é prefixo e não é comando exato
+                        token = buf.split()[0].lower()
+                        names = [m[0].lower() for m in matches]
+                        if token not in names:
+                            # completa para o selecionado
+                            buf = matches[selected][0] + (buf[len(token):] if len(buf) > len(token) else "")
+                            _redraw()
+                            continue
+                # limpa box antes de sair
+                if prev_box_lines:
+                    sys.stdout.write(f"\x1b[{prev_box_lines + 1}A\x1b[J")
+                    sys.stdout.write(visible_prompt + buf + "\r\n")
+                    sys.stdout.flush()
                 else:
-                    break
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                return buf
+            # Tab -> completa
+            if ch == "\t":
+                if buf.startswith("/"):
+                    matches = _inline_matches(buf.split()[0])
+                    if matches:
+                        token = buf.split()[0]
+                        sel_name = matches[selected][0]
+                        # substitui token pelo nome completo
+                        rest = buf[len(token):]
+                        buf = sel_name + rest
+                        selected = 0
+                        _redraw()
+                continue
+            # Backspace
+            if ch in ("\x7f", "\x08"):
+                if buf:
+                    buf = buf[:-1]
+                    selected = 0
+                    _redraw()
+                continue
+            # Escape -> sequências
+            if ch == "\x1b":
+                seq = ""
+                for _ in range(2):
+                    nxt = _read_nonblock(fd)
+                    if nxt is None:
+                        import select as _sel
+                        _sel.select([sys.stdin], [], [], 0.05)
+                        nxt = _read_nonblock(fd)
+                    if nxt is None:
+                        break
+                    seq += nxt
+                if seq == "[A":  # ↑
+                    if buf.startswith("/") and _inline_matches(buf.split()[0]):
+                        matches = _inline_matches(buf.split()[0])
+                        selected = (selected - 1) % len(matches)
+                        _redraw()
+                elif seq == "[B":  # ↓
+                    if buf.startswith("/") and _inline_matches(buf.split()[0]):
+                        matches = _inline_matches(buf.split()[0])
+                        selected = (selected + 1) % len(matches)
+                        _redraw()
+                elif seq == "":
+                    # Esc sozinho -> limpa box / cancela autocomplete
+                    if prev_box_lines:
+                        # limpa box
+                        sys.stdout.write(f"\x1b[{prev_box_lines + 1}A\x1b[J")
+                        sys.stdout.write(visible_prompt + buf)
+                        sys.stdout.flush()
+                        prev_box_lines = 0
+                    else:
+                        # Esc sem box -> cancela linha
+                        buf = ""
+                        _redraw()
+                continue
+            # Ctrl+U -> limpa linha
+            if ch == "\x15":
+                buf = ""
+                selected = 0
+                _redraw()
+                continue
+            # Ctrl+L -> limpa box
+            if ch == "\x0c":
+                _redraw()
+                continue
+            if ch.isprintable():
+                buf += ch
+                selected = 0
+                _redraw()
+                continue
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
             pass
-        return show_command_menu(c, initial_query=initial)
-    if ch == "\x03":
-        raise KeyboardInterrupt
-    if ch == "\x04":
-        sys.stdout.write("\r\n")
-        return None
+        # garante limpeza do box ao sair
+        if prev_box_lines:
+            try:
+                sys.stdout.write(f"\x1b[{prev_box_lines + 1}A\x1b[J")
+                sys.stdout.write(visible_prompt + buf)
+                sys.stdout.flush()
+            except Exception:
+                pass
 
-    # Limpa o prompt desenhado no modo raw e deixa readline redesenhá-lo.
-    sys.stdout.write("\r\x1b[2K")
-    sys.stdout.flush()
-    initial = ch if ch.isprintable() else ""
 
-    def insert_initial():
-        if initial:
-            readline.insert_text(initial)
-            readline.redisplay()
-
-    readline.set_startup_hook(insert_initial)
-    try:
-        return input(prompt)
-    except EOFError:
-        return None
-    finally:
-        readline.set_startup_hook(None)
+def _input_with_instant_palette(prompt, c):
+    """Mantido para compatibilidade: agora delega para inline."""
+    return _input_with_inline_autocomplete(prompt, c)
 
 
 def read_input(prompt, c):
