@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.8.3"
+VERSION = "1.9.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -585,11 +585,19 @@ DEFAULT_CONFIG = {
     "auto_backend": True,          # detecta LM Studio → Ollama automaticamente
     "project_context": True,       # injeta a árvore do projeto no contexto
     "auto_summarize": True,        # resume conversas longas automaticamente
+    "compression_threshold_tokens": 20000,  # ~80k chars, grátis estimativa local (tokens≈chars/4)
+    "compression_proactive_prune": True,   # poda tool results grandes sem chamar API
     "auto_save_code": False,       # True = salva blocos de código sem perguntar
     "mcp_enabled": True,           # conecta servidores MCP de ~/.send/mcp.json
     "hooks": True,                 # executa hooks de ~/.send/hooks.json
     "auto_mode": True,             # escolhe o modo sozinho (chat/coding/plan/workflow)
     "outmode": False,              # OUTMODE: age sem pedir autorização
+    # Guardrails grátis (local, sem API paga) — inspirado no Hermes
+    "guardrails_warnings": True,   # avisa quando detecta loop de ferramentas
+    "guardrails_hard_stop": False, # True = interrompe loop em vez de só avisar
+    # Memória limitada grátis (sem API) — evita injeção infinita no prompt
+    "memory_char_limit": 2200,     # ~800 tokens, pruned automaticamente
+    "memory_nudge_interval": 10,   # a cada 10 turnos lembra o modelo de salvar
 }
 
 # Backups automáticos antes de editar/escrever arquivos
@@ -665,14 +673,43 @@ def memory_summary(limit=1800):
 
 
 def remember_entry(content):
-    """Grava uma entrada com data na memória de longo prazo."""
+    """Grava uma entrada com data na memória de longo prazo (com limite grátis)."""
     try:
         SEND_HOME.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y-%m-%d %H:%M")
         entry = f"\n## {ts}\n- {content.strip()}\n"
         with open(MEMORY_PATH, "a", encoding="utf-8") as f:
             f.write(entry)
+        # Pruning grátis: se exceder limite, mantém 80% mais recente
+        try:
+            limit = 2200
+            # lê limite do config se possível (usa DEFAULT_CONFIG como fallback)
+            text = MEMORY_PATH.read_text(encoding="utf-8")
+            if len(text) > limit:
+                # mantém cabeçalho se houver e últimos 80%
+                keep = int(limit * 0.8)
+                pruned = text[-keep:]
+                # tenta cortar em quebra de seção
+                cut = pruned.find("\n## ")
+                if cut > 0:
+                    pruned = pruned[cut:]
+                header = "# Memória SEND — aprendizado acumulado (podado automaticamente)\n"
+                MEMORY_PATH.write_text(header + pruned, encoding="utf-8")
+        except Exception:
+            pass
         return True
+    except Exception:
+        return False
+
+def _memory_nudge_needed(sess):
+    """Grátis: a cada N turnos lembra o modelo de consolidar memória."""
+    try:
+        interval = sess.cfg.get("memory_nudge_interval", 10)
+        if not interval or interval <= 0:
+            return False
+        # conta turnos de usuário
+        user_turns = sum(1 for m in sess.messages if m.get("role") == "user")
+        return user_turns > 0 and user_turns % interval == 0
     except Exception:
         return False
 
@@ -1710,8 +1747,15 @@ WORKFLOW_FIX_SYSTEM = (
 )
 
 
-def system_prompt(cfg, extra=""):
+def system_prompt(cfg, extra="", sess=None):
     parts = [BASE_SYSTEM]
+    # Nudge grátis: a cada N turnos lembra de consolidar memória (sem API paga)
+    if sess is not None:
+        try:
+            if _memory_nudge_needed(sess):
+                parts.append(" [LEMBRETE: considere usar a ferramenta 'remember' se aprendeu algo útil nesta conversa.]")
+        except Exception:
+            pass
     mode = cfg.get("mode", "coding")
     if mode == "coding":
         parts.append(CODING_SYSTEM)
@@ -2894,18 +2938,65 @@ SUMMARY_THRESHOLD = 16
 SUMMARY_KEEP = 6
 
 
+def _estimate_tokens(msgs):
+    """Estimativa grátis local: tokens ≈ chars/4 (sem API paga)."""
+    total = 0
+    for m in msgs:
+        c = m.get("content") or ""
+        if isinstance(c, str):
+            total += len(c) // 4
+        # tool_calls também contam
+        if m.get("tool_calls"):
+            total += len(str(m["tool_calls"])) // 4
+    return total
+
+def _proactive_prune(msgs, protect_last_n=6):
+    """Poda determinística grátis: resume tool results >8000 chars sem chamar modelo."""
+    if len(msgs) <= protect_last_n:
+        return msgs, 0
+    pruned = 0
+    out = []
+    for i, m in enumerate(msgs):
+        if i >= len(msgs) - protect_last_n:
+            out.append(m)
+            continue
+        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 8000:
+            # trunca mantendo início e fim
+            c = m["content"]
+            pruned += len(c) - 2000
+            m = dict(m)
+            m["content"] = c[:1000] + "\n… (tool result podado grátis, " + str(len(c)) + " chars -> 2000) …\n" + c[-1000:]
+        out.append(m)
+    return out, pruned
+
 def summarize_conversation(sess, c):
     """Resume as mensagens antigas da conversa para economizar contexto.
 
     Mantém as últimas SUMMARY_KEEP mensagens e guarda o resumo em
     sess.summary, que é injetado no prompt de sistema. Retorna True se
     resumiu, False caso contrário.
+
+    Grátis: usa estimativa local de tokens (chars/4) e respeita
+    compression_threshold_tokens do config. Se só mensagens, usa fallback 16.
     """
     msgs = sess.messages
-    if len(msgs) <= SUMMARY_THRESHOLD:
+    # poda proativa grátis antes de decidir resumir (sem custo)
+    if sess.cfg.get("compression_proactive_prune", True):
+        msgs, pruned = _proactive_prune(msgs, SUMMARY_KEEP)
+        if pruned:
+            sess.messages = msgs
+            print(c.dim(f"✂ poda proativa: {pruned} chars de tool results antigos removidos (grátis)."))
+    # decide por tokens OU por contagem (compatível com modo grátis)
+    est_tokens = _estimate_tokens(msgs)
+    thresh = sess.cfg.get("compression_threshold_tokens", 20000)
+    by_count = len(msgs) > SUMMARY_THRESHOLD
+    by_tokens = est_tokens > thresh
+    if not (by_count or by_tokens):
         return False
     if sess.summary is not None and len(msgs) <= SUMMARY_THRESHOLD + SUMMARY_KEEP:
-        return False
+        # se já tem resumo, só resume de novo se cresceu bastante
+        if est_tokens < thresh * 0.8:
+            return False
     old = msgs[: -SUMMARY_KEEP]
     recent = msgs[-SUMMARY_KEEP:]
 
@@ -3013,7 +3104,7 @@ def call_model(sess, tools_enabled, c, cfg):
     if system_override:
         system_text = system_override
     else:
-        system_text = system_prompt(cfg, extra)
+        system_text = system_prompt(cfg, extra, sess)
     messages = [{"role": "system", "content": system_text}] + sess.messages
     payload = {
         "model": sess.model_id,
@@ -3151,10 +3242,59 @@ def _consume_stream(stream, c, cfg):
             "".join(reasoning_parts))
 
 
+def _guard_is_failure(result):
+    """Heurística local (grátis): detecta falha sem chamar API."""
+    if not result:
+        return False
+    low = result.lower()
+    return any(k in low for k in ("erro", "falhou", "falha", "não encontrada", "not found", "exception", "traceback"))
+
+def _guard_check(sess, name, args, result, history, c):
+    """Verifica loops; retorna (warn_msg ou None, should_hard_stop bool)."""
+    cfg = sess.cfg
+    if not cfg.get("guardrails_warnings") and not cfg.get("guardrails_hard_stop"):
+        return None, False
+    # exact_failure: mesma ferramenta + mesmos args + falha repetida
+    exact_count = 0
+    same_tool_fail = 0
+    idempotent = 0
+    # conta de trás pra frente
+    for h in reversed(history):
+        if h["name"] != name:
+            # para same_tool_failure, só conta consecutivos
+            if same_tool_fail > 0:
+                break
+            continue
+        # same tool
+        if _guard_is_failure(h["result"]) and _guard_is_failure(result):
+            same_tool_fail += 1
+        elif h["name"] == name and h["result"] == result and not _guard_is_failure(result):
+            idempotent += 1
+        # exact
+        if h["name"] == name and h["args"] == args and _guard_is_failure(h["result"]) and _guard_is_failure(result):
+            exact_count += 1
+    # thresholds grátis (Hermes usa 2/3/2 para warn)
+    warn = None
+    hard = False
+    if exact_count >= 1:  # já teve 1 antes, agora é 2ª vez igual
+        warn = f"⚠ Guardrail: '{name}' falhou 2x com os mesmos argumentos. Tente variar os args ou verifique o caminho."
+        if cfg.get("guardrails_hard_stop") and exact_count >= 4:
+            hard = True
+    elif same_tool_fail >= 2:  # 3ª falha mesma ferramenta (2 anteriores + atual)
+        warn = f"⚠ Guardrail: '{name}' falhou {same_tool_fail+1}x seguidas. Considere mudar de estratégia."
+        if cfg.get("guardrails_hard_stop") and same_tool_fail >= 7:
+            hard = True
+    elif idempotent >= 1:
+        warn = f"⚠ Guardrail: '{name}' retornou resultado idêntico {idempotent+1}x sem progresso. Evite repetir."
+        if cfg.get("guardrails_hard_stop") and idempotent >= 4:
+            hard = True
+    return warn, hard
+
 def run_agent(sess, tools_enabled, c, auto_confirm):
     """Laço de conversa com ferramentas. Retorna a resposta final."""
     cfg = sess.cfg
     content = ""
+    _guard_history = []  # lista de {name, args, result}
     for _ in range(MAX_TOOL_ROUNDS):
         content, calls, reasoning = call_model(sess, tools_enabled, c, cfg)
         if reasoning and getattr(sess, "last_reasoning", "") != reasoning:
@@ -3199,6 +3339,21 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
                     "O usuário recusou executar esta ferramenta. "
                     "Explique e prossiga sem executá-la."
                 )
+            # Guardrails grátis (sem API) — avisa/interrompe loops
+            warn, hard = _guard_check(sess, name, args, result, _guard_history, c)
+            if warn and cfg.get("guardrails_warnings", True):
+                print(c.yellow(f"  {warn}"))
+                # injeta aviso no resultado para o modelo perceber (soft warning)
+                result = result + "\n\n[AVISO GUARDRAIL: " + warn + " Tente outra abordagem.]"
+            if hard and cfg.get("guardrails_hard_stop"):
+                print(c.red("  ⛔ Guardrail hard-stop: interrompendo loop."))
+                sess.messages.append(
+                    {"role": "tool", "tool_call_id": tc["id"] or f"call_{len(sess.messages)}",
+                     "content": result + "\n[GUARDRAIL HARD-STOP]"}
+                )
+                _guard_history.append({"name": name, "args": args, "result": result})
+                break
+            _guard_history.append({"name": name, "args": args, "result": result})
             prev = result.split("\n")[0][:110]
             print(c.dim("  ╰─ " + (prev or "(sem saída)")))
             sess.messages.append(
