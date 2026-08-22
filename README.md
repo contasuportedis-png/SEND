@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.8.1 — assistente de IA no terminal (local ou na nuvem)
+⚡ SEND v1.8.2 — assistente de IA no terminal (local ou na nuvem)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
