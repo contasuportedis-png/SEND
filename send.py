@@ -3,8 +3,8 @@
 """
 SEND — assistente de IA para terminal (estilo Claude Code / Gemini CLI).
 
-Conecta automaticamente ao LM Studio (http://127.0.0.1:1234) ou a qualquer
-servidor compatível com a API da OpenAI.
+Conecta automaticamente ao LM Studio/Ollama ou a providers de nuvem e
+servidores customizados compatíveis com a API da OpenAI.
 
 Modos:
   - chat   : conversa normal, sem ferramentas
@@ -24,6 +24,7 @@ import argparse
 import atexit
 import difflib
 import fnmatch
+import getpass
 import html.parser
 import json
 import os
@@ -52,8 +53,52 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.7.0"
+VERSION = "1.8.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
+OLLAMA_URL = "http://127.0.0.1:11434"
+
+# Todos os serviços abaixo expõem uma API compatível com OpenAI. Isso mantém
+# ferramentas e streaming iguais entre nuvem e modelos locais. As chaves podem
+# vir do ambiente, evitando gravá-las no config.json.
+PROVIDER_PRESETS = {
+    "auto": {
+        "name": "Automático (LM Studio → Ollama)",
+        "base_url": DEFAULT_BASE_URL, "env_key": "", "local": True,
+    },
+    "lmstudio": {
+        "name": "LM Studio (local)",
+        "base_url": DEFAULT_BASE_URL, "env_key": "", "local": True,
+    },
+    "ollama": {
+        "name": "Ollama (local)",
+        "base_url": OLLAMA_URL, "env_key": "", "local": True,
+    },
+    "openai": {
+        "name": "OpenAI", "base_url": "https://api.openai.com",
+        "env_key": "OPENAI_API_KEY",
+    },
+    "claude": {
+        "name": "Claude (Anthropic)", "base_url": "https://api.anthropic.com",
+        "env_key": "ANTHROPIC_API_KEY",
+    },
+    "nvidia": {
+        "name": "NVIDIA NIM", "base_url": "https://integrate.api.nvidia.com",
+        "env_key": "NVIDIA_API_KEY",
+    },
+    "openrouter": {
+        "name": "OpenRouter", "base_url": "https://openrouter.ai/api",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    "groq": {
+        "name": "Groq", "base_url": "https://api.groq.com/openai",
+        "env_key": "GROQ_API_KEY",
+    },
+    "mistral": {
+        "name": "Mistral AI", "base_url": "https://api.mistral.ai",
+        "env_key": "MISTRAL_API_KEY",
+    },
+}
+
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
 )
@@ -485,7 +530,10 @@ def offer_save_code(content, c, cfg, auto_confirm, dest_dir=None):
 DEFAULT_CONFIG = {
     "base_url": DEFAULT_BASE_URL,
     "api_key": "",
-    "model": None,                 # None = detecta o primeiro modelo do LM Studio
+    "model": None,                 # None = detecta o primeiro modelo disponível
+    "provider": "auto",            # preset ou id de um provider customizado
+    "providers": {},               # configurações/último modelo por provider
+    "setup_complete": False,        # assistente de primeira inicialização concluído
     "mode": "coding",              # chat | coding | plan | workflow
     "thinking": False,
     "reasoning_effort": "medium",  # low | medium | high
@@ -503,8 +551,6 @@ DEFAULT_CONFIG = {
     "auto_mode": True,             # escolhe o modo sozinho (chat/coding/plan/workflow)
     "outmode": False,              # OUTMODE: age sem pedir autorização
 }
-
-OLLAMA_URL = "http://127.0.0.1:11434"
 
 # Backups automáticos antes de editar/escrever arquivos
 BACKUP_DIR = SEND_HOME / "backups"
@@ -1225,12 +1271,12 @@ def detect_backend(cfg, c):
     if cfg["base_url"] != DEFAULT_BASE_URL:
         return cfg["base_url"]  # URL customizada: não mexe
     try:
-        list_models(cfg["base_url"], cfg["api_key"])
+        list_models(cfg["base_url"], provider_api_key(cfg))
         return cfg["base_url"]  # LM Studio responde
     except Exception:
         pass
     try:
-        list_models(OLLAMA_URL, cfg["api_key"])
+        list_models(OLLAMA_URL, provider_api_key(cfg))
         print(c.yellow(f"⚡ LM Studio não respondeu — detectei o Ollama em "
                        f"{OLLAMA_URL} (use /backend para trocar)."))
         return OLLAMA_URL
@@ -1276,20 +1322,143 @@ def project_tree(max_entries=25, max_depth=2):
 
 
 
+def provider_spec(cfg, provider_id=None):
+    """Devolve a configuração efetiva de um provider (preset ou customizado)."""
+    provider_id = provider_id or cfg.get("provider", "auto")
+    spec = dict(PROVIDER_PRESETS.get(provider_id, {}))
+    spec.update(cfg.get("providers", {}).get(provider_id, {}))
+    spec.setdefault("id", provider_id)
+    spec.setdefault("name", provider_id)
+    return spec
+
+
+def provider_api_key(cfg, spec=None):
+    """Chave efetiva: variável do provider > SEND_API_KEY > chave salva."""
+    spec = spec or provider_spec(cfg)
+    env_name = spec.get("env_key", "")
+    saved = spec.get("api_key", "")
+    # O campo legado só pertence ao provider que está ativo. Nunca o reutilize
+    # ao trocar (por exemplo, não envie uma chave OpenAI para a Anthropic).
+    legacy = cfg.get("api_key", "") if spec.get("id") == cfg.get("provider") else ""
+    return ((os.environ.get(env_name) if env_name else None)
+            or os.environ.get("SEND_API_KEY") or saved or legacy)
+
+
+def activate_provider(cfg, provider_id, remember_current=True):
+    """Ativa um provider e sincroniza os campos legados base_url/api_key/model."""
+    if provider_id not in PROVIDER_PRESETS and provider_id not in cfg.get("providers", {}):
+        raise KeyError(provider_id)
+    providers = cfg.setdefault("providers", {})
+    old_id = cfg.get("provider", "auto")
+    if remember_current and old_id in providers:
+        providers[old_id]["model"] = cfg.get("model")
+    spec = provider_spec(cfg, provider_id)
+    cfg["provider"] = provider_id
+    cfg["base_url"] = spec["base_url"].rstrip("/")
+    # Variáveis de ambiente são resolvidas só no momento da chamada e nunca
+    # copiadas para config.json.
+    cfg["api_key"] = spec.get("api_key", "")
+    cfg["model"] = spec.get("model")
+    # Só o preset auto alterna sozinho entre os dois servidores locais.
+    cfg["auto_backend"] = provider_id == "auto"
+    return spec
+
+
+def _safe_provider_id(name):
+    value = re.sub(r"[^a-z0-9_-]+", "-", name.strip().lower()).strip("-")
+    return value or "custom"
+
+
+def configure_provider(cfg, provider_id, c, input_fn=input):
+    """Configura um preset ou cria um provider OpenAI-compatible customizado."""
+    providers = cfg.setdefault("providers", {})
+    if provider_id == "custom":
+        try:
+            name = input_fn("Nome do provider: ").strip()
+            base_url = input_fn("Base URL (ex.: https://api.exemplo.com): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not name or not base_url.startswith(("http://", "https://")):
+            print(c.yellow("Nome ou URL inválidos; configuração cancelada."))
+            return None
+        provider_id = _safe_provider_id(name)
+        original = provider_id
+        n = 2
+        while provider_id in PROVIDER_PRESETS or provider_id in providers:
+            provider_id, n = f"{original}-{n}", n + 1
+        providers[provider_id] = {"name": name, "base_url": base_url.rstrip("/"),
+                                  "api_key": "", "model": None, "custom": True}
+    elif provider_id not in PROVIDER_PRESETS:
+        return None
+    spec = provider_spec(cfg, provider_id)
+    if not spec.get("local"):
+        env_name = spec.get("env_key", "")
+        if env_name and os.environ.get(env_name):
+            print(c.green(f"✅ Chave encontrada em {env_name}."))
+        elif not spec.get("api_key"):
+            try:
+                key = getpass.getpass(
+                    f"API key de {spec['name']} (Enter para configurar depois): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                key = ""
+            if key:
+                providers.setdefault(provider_id, {})["api_key"] = key
+    activate_provider(cfg, provider_id)
+    cfg["setup_complete"] = True
+    save_config(cfg)
+    return provider_id
+
+
+def first_run_setup(cfg, c):
+    """Assistente exibido apenas na primeira execução interativa."""
+    if cfg.get("setup_complete") or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    print()
+    panel("✨ PRIMEIRA CONFIGURAÇÃO",
+          "Escolha seu provider de IA. LM Studio e Ollama continuam sendo\n"
+          "detectados automaticamente e não exigem configuração.", c, width=72)
+    choices = ["auto", "openai", "claude", "nvidia", "openrouter", "groq",
+               "mistral", "custom"]
+    for i, pid in enumerate(choices, 1):
+        label = "Provider customizado (OpenAI-compatible)" if pid == "custom" \
+            else PROVIDER_PRESETS[pid]["name"]
+        print(f"  {i}. {label}")
+    try:
+        raw = input("Escolha [1]: ").strip() or "1"
+        idx = int(raw) - 1
+        provider_id = choices[idx]
+    except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+        provider_id = "auto"
+    selected = configure_provider(cfg, provider_id, c)
+    if selected:
+        print(c.green(f"✅ Provider ativo: {provider_spec(cfg)['name']}"))
+        print(c.dim("   Use 'provider' para adicionar/trocar e 'model' para trocar o modelo."))
+    return bool(selected)
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
+    cfg["providers"] = {}
+    data = {}
     try:
         if CONFIG_PATH.exists():
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
             cfg.update({k: v for k, v in data.items() if k in cfg})
+            # Configurações de versões anteriores já estavam prontas para uso.
+            if "setup_complete" not in data:
+                cfg["setup_complete"] = True
     except Exception:
         pass
+    if cfg.get("provider") != "auto" or cfg.get("providers"):
+        try:
+            activate_provider(cfg, cfg.get("provider", "auto"), remember_current=False)
+        except KeyError:
+            cfg["provider"] = "auto"
     if os.environ.get("SEND_BASE_URL"):
         cfg["base_url"] = os.environ["SEND_BASE_URL"].rstrip("/")
     if os.environ.get("SEND_MODEL"):
         cfg["model"] = os.environ["SEND_MODEL"]
-    if os.environ.get("SEND_API_KEY"):
-        cfg["api_key"] = os.environ["SEND_API_KEY"]
     return cfg
 
 
@@ -1313,6 +1482,11 @@ def _request(url, payload=None, api_key="", method="POST", timeout=30):
     req.add_header("Content-Type", "application/json")
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
+        # A camada OpenAI-compatible da Anthropic aceita o mesmo payload, mas
+        # clientes diretos também esperam estes cabeçalhos.
+        if "api.anthropic.com" in url:
+            req.add_header("x-api-key", api_key)
+            req.add_header("anthropic-version", "2023-06-01")
     return urllib.request.urlopen(req, timeout=timeout)
 
 
@@ -1347,23 +1521,26 @@ def list_models(base_url, api_key=""):
 
 
 def resolve_model(cfg, c):
-    """Retorna o id do modelo: o configurado ou o primeiro do LM Studio."""
+    """Retorna o modelo configurado ou o primeiro oferecido pelo provider."""
     if cfg.get("model"):
         return cfg["model"]
+    spec = provider_spec(cfg)
     try:
-        models = list_models(cfg["base_url"], cfg["api_key"])
+        models = list_models(cfg["base_url"], provider_api_key(cfg, spec))
     except urllib.error.URLError as e:
+        local_hint = ("\n  ➜ Inicie o LM Studio ou Ollama e carregue um modelo."
+                      if spec.get("local") else
+                      "\n  ➜ Verifique a URL, a conexão e a API key do provider.")
         raise ConnectionError(
-            f"Não consegui conectar ao LM Studio em {cfg['base_url']} ({e.reason}).\n"
-            "  ➜ Abra o LM Studio, carregue um modelo e clique em "
-            "'Developer' → 'Start Server' (porta 1234)."
+            f"Não consegui conectar a {spec['name']} em {cfg['base_url']} "
+            f"({e.reason}).{local_hint}"
         )
     except Exception as e:
-        raise ConnectionError(f"Erro ao consultar o LM Studio em {cfg['base_url']}: {e}")
+        raise ConnectionError(f"Erro ao consultar {spec['name']} em {cfg['base_url']}: {e}")
     if not models:
         raise ConnectionError(
-            "O LM Studio respondeu, mas nenhum modelo está carregado.\n"
-            "  ➜ Carregue um modelo no LM Studio e tente de novo."
+            f"{spec['name']} respondeu, mas não informou nenhum modelo.\n"
+            "  ➜ Use 'model <id>' para definir um modelo manualmente."
         )
     return models[0]
 
@@ -2693,7 +2870,7 @@ def call_model(sess, tools_enabled, c, cfg):
         payload["reasoning_effort"] = cfg["reasoning_effort"]
 
     try:
-        stream = stream_sse(cfg["base_url"] + "/v1/chat/completions", payload, cfg["api_key"])
+        stream = stream_sse(cfg["base_url"] + "/v1/chat/completions", payload, provider_api_key(cfg))
         return _consume_stream(stream, c, cfg)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -2707,7 +2884,7 @@ def call_model(sess, tools_enabled, c, cfg):
             cfg["thinking"] = False
             payload.pop("reasoning_effort", None)
             stream = stream_sse(cfg["base_url"] + "/v1/chat/completions",
-                                payload, cfg["api_key"])
+                                payload, provider_api_key(cfg))
             return _consume_stream(stream, c, cfg)
         raise
 
@@ -3140,8 +3317,9 @@ COMMANDS = [
     ("/pensamento", "/pensamento", "Mostra o último pensamento do modelo (expandido)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
-    ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
-    ("/models", "/models", "Lista os modelos carregados no servidor", "modelo"),
+    ("/provider", "/provider [nome|add]", "Adiciona ou troca o provider de IA", "modelo"),
+    ("/model", "/model [nome]", "Lista ou troca o modelo do provider atual", "modelo"),
+    ("/models", "/models", "Lista os modelos do provider atual", "modelo"),
     ("/thinking", "/thinking [on|off]", "Liga/desliga o pensamento do modelo", "modelo"),
     ("/backend", "/backend [lmstudio|ollama|url]", "Mostra ou troca o servidor (LM Studio / Ollama)", "modelo"),
     ("/code", "/code", "Modo coding: usa as skills (arquivos, terminal, internet, pc)", "modo"),
@@ -3470,8 +3648,10 @@ def cmd_config(sess, rest, c, tools_enabled):
     if not parts:
         lines = []
         for k, v in cfg.items():
-            if k == "skills":
+            if k in ("skills", "providers"):
                 continue
+            if k == "api_key" and v:
+                v = "••••••••"
             mark = "" if k in EDITABLE_CONFIG else c.dim(" (fixa)")
             lines.append(f"{k:<18} = {v}{mark}")
         lines.append("")
@@ -3495,8 +3675,16 @@ def cmd_config(sess, rest, c, tools_enabled):
         print(c.yellow(f"Valor inválido para {key}: {raw!r}"))
         return False, tools_enabled
     cfg[key] = value
+    if key in ("base_url", "api_key", "model"):
+        active = cfg.setdefault("providers", {}).setdefault(
+            cfg.get("provider", "auto"), {}
+        )
+        active[key] = value
+        if key == "base_url":
+            cfg["auto_backend"] = False
     save_config(cfg)
-    print(f"✅ {key} = {value}")
+    shown = "••••••••" if key == "api_key" and value else value
+    print(f"✅ {key} = {shown}")
     return False, tools_enabled
 
 
@@ -3527,6 +3715,86 @@ def cmd_backups(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+def cmd_provider(sess, rest, c, tools_enabled):
+    """Lista, adiciona ou troca o provider da sessão."""
+    cfg = sess.cfg
+    configured = cfg.get("providers", {})
+    if not rest:
+        print(f"Provider atual: {provider_spec(cfg)['name']} ({cfg.get('provider', 'auto')})")
+        print("Disponíveis:")
+        ids = list(PROVIDER_PRESETS)
+        for pid in ids:
+            mark = " ← atual" if pid == cfg.get("provider") else ""
+            ready = ("local/automático" if PROVIDER_PRESETS[pid].get("local") else
+                     ("configurado" if pid in configured or
+                      os.environ.get(PROVIDER_PRESETS[pid].get("env_key", "")) else
+                      "requer API key"))
+            print(f"  • {pid:<12} {PROVIDER_PRESETS[pid]['name']} [{ready}]{mark}")
+        for pid, spec in configured.items():
+            if pid not in PROVIDER_PRESETS:
+                mark = " ← atual" if pid == cfg.get("provider") else ""
+                print(f"  • {pid:<12} {spec.get('name', pid)} [customizado]{mark}")
+        print("Use: provider <nome> | provider add | provider custom")
+        return False, tools_enabled
+
+    arg = rest.strip().lower()
+    if arg.startswith("add "):
+        arg = arg[4:].strip()
+    if arg in ("add", "custom", "novo"):
+        arg = "custom"
+    if arg not in PROVIDER_PRESETS and arg not in configured and arg != "custom":
+        print(c.yellow(f"Provider desconhecido: {arg}. Use /provider para listar."))
+        return False, tools_enabled
+    selected = configure_provider(cfg, arg, c)
+    if not selected:
+        return False, tools_enabled
+    sess.model_id = None
+    spec = provider_spec(cfg)
+    key = provider_api_key(cfg, spec)
+    if not spec.get("local") and not key:
+        env_name = spec.get("env_key")
+        hint = f" ou defina {env_name}" if env_name else ""
+        print(c.yellow(f"⚠ API key ainda não configurada{hint}."))
+    print(c.green(f"✅ Provider ativo: {spec['name']} ({cfg['base_url']})"))
+    return False, tools_enabled
+
+
+def cmd_model(sess, rest, c, tools_enabled):
+    """Lista os modelos do provider atual e permite trocar o selecionado."""
+    cfg = sess.cfg
+    try:
+        models = list_models(cfg["base_url"], provider_api_key(cfg))
+    except Exception as e:
+        models = []
+        if not rest:
+            print(c.yellow(f"⚠ Não foi possível listar modelos: {e}"))
+    name = rest.strip()
+    if not name:
+        current = sess.model_id or cfg.get("model") or "auto"
+        print(f"Modelo atual em {provider_spec(cfg)['name']}: {current}")
+        for i, model_id in enumerate(models, 1):
+            mark = " ← atual" if model_id == current else ""
+            print(f"  {i}. {model_id}{mark}")
+        if models and sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                raw = input("Escolha um número (Enter cancela): ").strip()
+                if raw:
+                    name = models[int(raw) - 1]
+            except (ValueError, IndexError, EOFError, KeyboardInterrupt):
+                return False, tools_enabled
+        if not name:
+            return False, tools_enabled
+    if models and name not in models:
+        print(c.yellow(f"⚠ '{name}' não aparece na lista do provider. "
+                       "O ID será usado mesmo assim."))
+    cfg["model"] = name
+    cfg.setdefault("providers", {}).setdefault(cfg.get("provider", "auto"), {})["model"] = name
+    sess.model_id = name
+    save_config(cfg)
+    print(f"✅ Modelo definido: {name}")
+    return False, tools_enabled
+
+
 def cmd_backend(sess, rest, c, tools_enabled):
     cfg = sess.cfg
     if not rest:
@@ -3535,17 +3803,19 @@ def cmd_backend(sess, rest, c, tools_enabled):
         print("  Troque com: /backend lmstudio | ollama | <url>")
         return False, tools_enabled
     arg = rest.strip().lower()
-    if arg == "lmstudio":
-        url = DEFAULT_BASE_URL
-    elif arg == "ollama":
-        url = OLLAMA_URL
+    if arg in ("lmstudio", "ollama"):
+        activate_provider(cfg, arg)
     elif arg.startswith("http://") or arg.startswith("https://"):
-        url = arg
+        pid = "backend-custom"
+        cfg.setdefault("providers", {})[pid] = {
+            "name": "Backend customizado", "base_url": arg.rstrip("/"),
+            "api_key": cfg.get("api_key", ""), "model": None, "custom": True,
+        }
+        activate_provider(cfg, pid)
     else:
         print(c.yellow("Use: /backend lmstudio | ollama | <url>"))
         return False, tools_enabled
-    cfg["base_url"] = url.rstrip("/")
-    cfg["auto_backend"] = False
+    cfg["setup_complete"] = True
     save_config(cfg)
     sess.model_id = None  # força re-detecção do modelo no novo servidor
     print(f"✅ Servidor: {cfg['base_url']}")
@@ -3752,32 +4022,17 @@ def handle_command(sess, line, c, tools_enabled):
         sess.messages = []
         print("🧹 Conversa limpa.")
         return False, tools_enabled
+    if cmd == "/provider":
+        return cmd_provider(sess, rest, c, tools_enabled)
     if cmd == "/model":
-        if not rest:
-            print(f"Modelo atual: {sess.model_id or cfg['model'] or 'auto'}")
-        else:
-            name = rest
-            try:
-                available = list_models(cfg["base_url"], cfg["api_key"])
-                if available and name not in available:
-                    print(c.yellow(
-                        f"⚠ '{name}' não está carregado no LM Studio. "
-                        f"Disponíveis: {', '.join(available)}"
-                    ))
-            except Exception:
-                pass
-            cfg["model"] = name
-            sess.model_id = name
-            save_config(cfg)
-            print(f"✅ Modelo definido: {name}")
-        return False, tools_enabled
+        return cmd_model(sess, rest, c, tools_enabled)
     if cmd == "/models":
         try:
-            models = list_models(cfg["base_url"], cfg["api_key"])
+            models = list_models(cfg["base_url"], provider_api_key(cfg))
             if not models:
-                print(c.yellow("⚠ Nenhum modelo carregado no LM Studio."))
+                print(c.yellow(f"⚠ Nenhum modelo informado por {provider_spec(cfg)['name']}."))
             else:
-                print(f"Modelos em {cfg['base_url']}:")
+                print(f"Modelos de {provider_spec(cfg)['name']} em {cfg['base_url']}:")
                 for m in models:
                     mark = " ← atual" if m == (sess.model_id or cfg["model"]) else ""
                     print(f"  • {m}{mark}")
@@ -3920,6 +4175,7 @@ def handle_command(sess, line, c, tools_enabled):
     if cmd == "/status":
         skills = cfg.get("skills", SKILL_ORDER)
         lines = [
+            f"Provider     : {provider_spec(cfg)['name']} ({cfg.get('provider', 'auto')})",
             f"Servidor     : {cfg['base_url']}",
             f"Modelo       : {sess.model_id or cfg['model'] or 'auto'}",
             f"Modo         : {cfg['mode']}",
@@ -4054,6 +4310,12 @@ def repl(sess, c, tools_enabled):
             if not choice:
                 continue
             line = choice
+        # Os dois comandos de configuração também funcionam sem a barra, como
+        # documentado no onboarding (as versões /provider e /model permanecem).
+        if line == "provider" or line.startswith("provider "):
+            line = "/" + line
+        elif line == "model" or line.startswith("model "):
+            line = "/" + line
         if line.startswith("/"):
             do_exit, tools_enabled = handle_command(sess, line, c, tools_enabled)
             if do_exit:
@@ -4220,7 +4482,7 @@ def doctor(cfg, c):
     small("Testando conexão", cfg["base_url"], c)
     t0 = time.time()
     try:
-        models = list_models(cfg["base_url"], cfg["api_key"])
+        models = list_models(cfg["base_url"], provider_api_key(cfg))
         dt = (time.time() - t0) * 1000
         print(c.green(f"  ✅ Conexão OK em {dt:.0f} ms"))
         if models:
@@ -4307,7 +4569,7 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog="send",
         description="SEND — assistente de IA no terminal (estilo Claude Code), "
-                    "conectado ao LM Studio (http://127.0.0.1:1234).",
+                    "com providers locais, de nuvem ou customizados.",
         epilog="Exemplos:\n"
                "  send                          modo interativo\n"
                "  send \"explique este código\"   resposta única\n"
@@ -4320,7 +4582,7 @@ def parse_args(argv=None):
     ap.add_argument("prompt", nargs="*", help="prompt para execução única "
                     "(se omitido, abre o modo interativo)")
     ap.add_argument("-m", "--model", help="ID do modelo (padrão: primeiro "
-                    "modelo carregado no LM Studio)")
+                    "modelo disponível no provider)")
     ap.add_argument("-u", "--base-url", default=None,
                     help=f"URL do servidor (padrão: {DEFAULT_BASE_URL})")
     ap.add_argument("-c", "--code", action="store_true",
@@ -4357,9 +4619,9 @@ def parse_args(argv=None):
     ap.add_argument("--temperature", type=float,
                     help="temperatura do modelo (padrão: 0.7)")
     ap.add_argument("--models", action="store_true",
-                    help="lista os modelos disponíveis no LM Studio e sai")
+                    help="lista os modelos disponíveis no provider e sai")
     ap.add_argument("--doctor", action="store_true",
-                    help="diagnostica a instalação e a conexão com o LM Studio")
+                    help="diagnostica a instalação e a conexão com o provider")
     ap.add_argument("--update", action="store_true",
                     help="atualiza o SEND para a versão mais recente")
     ap.add_argument("--install", action="store_true",
@@ -4384,6 +4646,8 @@ def main(argv=None):
         return self_update(c)
 
     cfg = load_config()
+    if not args.base_url and not args.doctor and not args.models:
+        first_run_setup(cfg, c)
     if args.base_url:
         cfg["base_url"] = args.base_url.rstrip("/")
     if args.model:
@@ -4414,7 +4678,7 @@ def main(argv=None):
 
     if args.models:
         try:
-            models = list_models(cfg["base_url"], cfg["api_key"])
+            models = list_models(cfg["base_url"], provider_api_key(cfg))
             if not models:
                 print(c.yellow("⚠ Nenhum modelo carregado no LM Studio."))
                 return 1

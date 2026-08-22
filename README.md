@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.7.0 — assistente de IA no terminal (LM Studio)
+⚡ SEND v1.8.0 — assistente de IA no terminal (local ou na nuvem)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -125,10 +125,31 @@ Quando o modelo escreve código, o SEND pergunta se quer **salvar no disco**:
 send --save-code "crie um script que ordene uma lista"   # salva sozinho
 ```
 
+## 🔌 Providers de IA e configuração inicial
+
+Na primeira execução interativa, o SEND pergunta qual provider você deseja usar.
+Há presets para **OpenAI, Claude (Anthropic), NVIDIA NIM, OpenRouter, Groq e
+Mistral**, além de qualquer provider **customizado compatível com a API da
+OpenAI**. A chave pode ser informada no assistente ou pelas variáveis
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`,
+`OPENROUTER_API_KEY`, `GROQ_API_KEY` e `MISTRAL_API_KEY`.
+
+Dois comandos ficam disponíveis durante toda a sessão, com ou sem `/`:
+
+```text
+provider                 # lista providers e mostra o atual
+provider openai          # adiciona/ativa um preset
+provider add             # cria um provider customizado
+model                    # lista modelos do provider atual e permite escolher
+model gpt-5              # troca diretamente pelo ID
+```
+
 ## 🔄 Backend automático: LM Studio **ou** Ollama
 
-O SEND tenta o LM Studio (`http://127.0.0.1:1234`) primeiro; se não estiver
-rodando, **detecta sozinho o Ollama** (`http://127.0.0.1:11434`) e avisa.
+A opção padrão continua totalmente automática: o SEND tenta o LM Studio
+(`http://127.0.0.1:1234`) primeiro; se não estiver rodando, **detecta sozinho o
+Ollama** (`http://127.0.0.1:11434`) e avisa. Nenhuma chave ou configuração é
+necessária para esses providers locais.
 Para trocar manualmente:
 
 ```
@@ -491,7 +512,8 @@ autocompletar comandos.
 
 ```
 /help     /skills [nome] [on|off]   /memoria   /resumo   /pensamento   /clear   /exit
-/model [nome]   /models   /thinking on|off   /backend [lmstudio|ollama|url]
+/provider [nome|add]   /model [nome]   /models   /thinking on|off
+/backend [lmstudio|ollama|url]
 /code     /chat   /plan   /workflow   /tools on|off
 /automode [on|off]   /outmode [on|off]
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
