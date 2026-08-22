@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -618,7 +618,8 @@ SKILLS = {
     "memoria": "aprender com o tempo: lembrar informações, ver a memória "
                "de longo prazo e criar novas skills para o futuro",
     "subagentes": "delegar tarefas a subagentes especializados (revisor, "
-                  "pesquisador, analista…) e criar novos subagentes",
+                  "pesquisador, analista…), criar novos subagentes e montar "
+                  "equipes de 2+ IAs trabalhando juntas (team)",
 }
 
 SKILL_ORDER = ["arquivos", "terminal", "internet", "pc",
@@ -1277,6 +1278,199 @@ def tool_create_subagent(args, c, cfg=None):
                 "Disponível imediatamente para delegação.")
     except Exception as e:
         return f"Erro ao criar subagente: {e}"
+
+
+def _parse_team_agent(spec):
+    """Parseia 'nome' ou 'nome@model' ou 'nome:provider/model' -> (nome, model_override, provider_override)."""
+    spec = spec.strip()
+    if not spec:
+        return None, None, None
+    # suporta 'nome@model' e 'nome:provider/model' (ex: revisor:openai/gpt-4o)
+    model_override = None
+    provider_override = None
+    name = spec
+    if "@" in spec:
+        # formato nome@model
+        parts = spec.split("@", 1)
+        name = parts[0].strip().lower()
+        model_override = parts[1].strip()
+    elif ":" in spec and "/" in spec:
+        # formato nome:provider/model  -> ex: revisor:openai/gpt-4o
+        idx = spec.find(":")
+        name = spec[:idx].strip().lower()
+        rest = spec[idx+1:].strip()
+        if "/" in rest:
+            prov, mod = rest.split("/", 1)
+            provider_override = prov.strip()
+            model_override = mod.strip()
+        else:
+            model_override = rest
+    else:
+        name = spec.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,40}", name):
+        return None, None, None
+    return name, model_override, provider_override
+
+
+def run_team(tarefa, agentes, estrategia, c, cfg=None):
+    """Executa uma equipe de 2+ subagentes em paralelo (grátis, local) e sintetiza.
+
+    Cada agente pode ser 'nome' ou 'nome@model' para usar modelo diferente.
+    Estratégias:
+      paralelo   -> todos rodam ao mesmo tempo com a mesma tarefa (papel diferente)
+      debate     -> primeiro propõe, segundo critica, terceiro sintetiza
+      sequencial -> cada um rodando após o anterior, vendo resultado anterior
+    Retorna texto com síntese + detalhes por agente.
+    """
+    if not agentes or len(agentes) < 2:
+        return "Erro: equipe precisa de pelo menos 2 agentes (ex.: ['revisor','pesquisador'])."
+    if not tarefa or not tarefa.strip():
+        return "Erro: informe 'tarefa' para a equipe."
+    estrategia = (estrategia or "paralelo").strip().lower()
+    if estrategia not in ("paralelo", "debate", "sequencial"):
+        estrategia = "paralelo"
+
+    # valida agentes
+    parsed = []
+    for spec in agentes:
+        name, model_o, prov_o = _parse_team_agent(str(spec))
+        if not name:
+            return f"Erro: agente inválido '{spec}' (use nome em minúsculas, a-z0-9_-)."
+        sa = next((s for s in load_subagents() if s["name"] == name), None)
+        if not sa:
+            return f"Erro: subagente '{name}' não existe. Liste com /subagentes ou crie com create_subagent."
+        parsed.append((name, model_o, prov_o, sa))
+
+    print(c.cyan(f"  👥 equipe {estrategia} ") + c.bold(f"{len(parsed)} IAs") + c.dim(f" — {', '.join(a[0] for a in parsed)}"))
+    print(c.dim(f"  ─ tarefa: {tarefa[:120]}{'...' if len(tarefa) > 120 else ''}"))
+
+    results = {}
+    errors = {}
+
+    def _run_one(name, model_o, prov_o, sa):
+        try:
+            sub_cfg = dict(cfg or DEFAULT_CONFIG)
+            # modelo diferente por agente (grátis: mesmo servidor local, modelo diferente)
+            if model_o:
+                sub_cfg["model"] = model_o
+            if prov_o:
+                sub_cfg["provider"] = prov_o
+            sub = Session(sub_cfg, c)
+            sub.system_override = subagent_system_prompt(sub_cfg, sa)
+            # estratégia muda o prompt da tarefa
+            if estrategia == "debate":
+                role_tarefa = f"[DEBATE - você é {name}] {tarefa}"
+            elif estrategia == "sequencial":
+                role_tarefa = f"[SEQUENCIAL - equipe {estrategia}] {tarefa}"
+            else:
+                role_tarefa = tarefa
+            sub.messages = [{"role": "user", "content": "Tarefa da equipe: " + role_tarefa}]
+            if sa["tools"] is None:
+                sub.custom_tools = [t for t in TOOLS if t["function"]["name"] in SUBAGENT_DEFAULT_TOOLS]
+                tools_on = True
+            elif not sa["tools"]:
+                sub.custom_tools = []
+                tools_on = False
+            elif "todas" in sa["tools"] or "todos" in sa["tools"]:
+                sub.custom_tools = None
+                tools_on = True
+            else:
+                sub.custom_tools = tools_by_names(sa["tools"])
+                tools_on = True
+            content = ask_model(sub, tools_on, c, True)
+            results[name] = content or "(sem resposta)"
+        except Exception as e:
+            errors[name] = str(e)
+            results[name] = f"Erro: {e}"
+
+    if estrategia == "sequencial":
+        # sequencial: um após o outro, cada um vê resultado anterior (grátis)
+        prev_text = ""
+        for name, model_o, prov_o, sa in parsed:
+            tarefa_seq = tarefa + (f"\n\nResultado anterior da equipe:\n{prev_text[:2000]}" if prev_text else "")
+            # redefine _run_one temporariamente para usar tarefa_seq
+            def _run_seq(n=name, m=model_o, p=prov_o, s=sa, task=tarefa_seq):
+                try:
+                    sub_cfg = dict(cfg or DEFAULT_CONFIG)
+                    if m:
+                        sub_cfg["model"] = m
+                    if p:
+                        sub_cfg["provider"] = p
+                    sub = Session(sub_cfg, c)
+                    sub.system_override = subagent_system_prompt(sub_cfg, s)
+                    sub.messages = [{"role": "user", "content": "Tarefa da equipe (sequencial): " + task}]
+                    if s["tools"] is None:
+                        sub.custom_tools = [t for t in TOOLS if t["function"]["name"] in SUBAGENT_DEFAULT_TOOLS]
+                        tools_on = True
+                    elif not s["tools"]:
+                        sub.custom_tools = []
+                        tools_on = False
+                    elif "todas" in s["tools"] or "todos" in s["tools"]:
+                        sub.custom_tools = None
+                        tools_on = True
+                    else:
+                        sub.custom_tools = tools_by_names(s["tools"])
+                        tools_on = True
+                    content = ask_model(sub, tools_on, c, True)
+                    results[n] = content or "(sem resposta)"
+                except Exception as e:
+                    errors[n] = str(e)
+                    results[n] = f"Erro: {e}"
+            _run_seq()
+            prev_text = results.get(name, "")
+    else:
+        # paralelo e debate: todos em threads ao mesmo tempo
+        threads = []
+        for name, model_o, prov_o, sa in parsed:
+            th = threading.Thread(target=_run_one, args=(name, model_o, prov_o, sa), daemon=True)
+            th.start()
+            threads.append(th)
+        for th in threads:
+            th.join(timeout=180)
+
+    # verifica timeouts
+    for name, _, _, _ in parsed:
+        if name not in results:
+            results[name] = "(timeout - sem resposta em 180s)"
+            errors[name] = "timeout"
+
+    # síntese grátis: usa o modelo principal (pode ser local) para juntar o melhor
+    synth_cfg = dict(cfg or DEFAULT_CONFIG)
+    synth = Session(synth_cfg, c)
+    synth.system_override = BASE_SYSTEM + " Você é o coordenador de uma equipe de IAs. Sintetize o trabalho de 2+ subagentes em uma resposta final objetiva, mantendo o melhor de cada um e eliminando contradições. Se for código, entregue o código final completo."
+    combined = ""
+    for name, _, _, _ in parsed:
+        combined += f"\n\n--- Resultado de '{name}' ---\n" + (results.get(name) or "")[:4000]
+    synth.messages = [{"role": "user", "content": f"Tarefa original: {tarefa}\n\nEstratégia: {estrategia}\n{combined}\n\nAgora sintetize o resultado final da equipe de forma coesa. Se houver código, entregue o código final. Se houver divergência, escolha a melhor abordagem e explique."}]
+    try:
+        print(c.dim("  🧠 sintetizando equipe..."))
+        final = ask_model(synth, False, c, True) or ""
+    except Exception as e:
+        final = f"(falha na síntese: {e})\n" + combined[:4000]
+
+    out = [c.bold(c.cyan(f"✅ Equipe {estrategia} concluída ({len(parsed)} IAs)")), ""]
+    out.append(final.strip() or "(sem síntese)")
+    out.append("")
+    out.append(c.dim("── Detalhes por agente ──"))
+    for name, _, _, _ in parsed:
+        out.append("")
+        out.append(c.bold(f"🤖 {name}:"))
+        out.append((results.get(name) or "")[:2000])
+        if name in errors:
+            out.append(c.yellow(f" (erro: {errors[name]})"))
+    return "\n".join(out)
+
+
+def tool_team(args, c, cfg=None):
+    """Ferramenta 'team': equipe de 2+ IAs colaborando."""
+    tarefa = str(args.get("tarefa") or "").strip()
+    agentes = args.get("agentes") or []
+    estrategia = str(args.get("estrategia") or "paralelo").strip()
+    if not isinstance(agentes, list):
+        return "Erro: 'agentes' deve ser uma lista (ex.: ['revisor','pesquisador'])."
+    # limpa lista
+    agentes = [str(a).strip() for a in agentes if str(a).strip()]
+    return run_team(tarefa, agentes, estrategia, c, cfg)
 
 
 def backup_file(path):
@@ -2295,6 +2489,34 @@ TOOLS = [
         },
         "skill": "subagentes",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "team",
+            "description": "EQUIPE de 2+ subagentes (IAs) trabalhando JUNTAS em paralelo para entregar algo melhor. Cada subagente tem papel diferente e o SEND sintetiza o melhor dos dois. Grátis: usa seus modelos locais (pode ser o mesmo modelo com papéis diferentes ou modelos diferentes se você tiver ex.: 'revisor:qwen2.5-coder-7b'). Use para tarefas grandes que se beneficiam de duas visões (código + revisão, pesquisa + análise).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tarefa": {
+                        "type": "string",
+                        "description": "Tarefa completa e objetiva para a equipe.",
+                    },
+                    "agentes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Lista de 2+ subagentes. Pode ser só o nome ('revisor') ou 'nome@model' / 'nome:provider/model' para usar modelos diferentes (ex.: ['revisor:qwen2.5-coder-7b','pesquisador']).",
+                    },
+                    "estrategia": {
+                        "type": "string",
+                        "enum": ["paralelo", "debate", "sequencial"],
+                        "description": "Como colaboram: paralelo (todos juntos e sintetiza), debate (um propõe, outro critica), sequencial (um após o outro). Padrão: paralelo.",
+                    },
+                },
+                "required": ["tarefa", "agentes"],
+            },
+        },
+        "skill": "subagentes",
+    },
 ]
 
 def ask_yes_no(c, question, default=False):
@@ -2446,6 +2668,8 @@ def _dispatch_tool(name, args, c, auto_confirm, cfg=None):
         return tool_delegate(args, c, cfg)
     if name == "create_subagent":
         return tool_create_subagent(args, c, cfg)
+    if name == "team":
+        return tool_team(args, c, cfg)
     if name.startswith("mcp_"):
         return tool_mcp_call(name, args, c, cfg)
     if name.startswith("skill_"):
@@ -3689,6 +3913,7 @@ COMMANDS = [
     ("/backups", "/backups [restore n]", "Lista/restaura backups de arquivos alterados", "sistema"),
     ("/contexto", "/contexto [on|off]", "Liga/desliga o contexto do projeto no prompt", "sistema"),
     ("/subagentes", "/subagentes [nome] [tarefa]", "Lista os subagentes ou roda um (ex.: /subagentes revisor revise este código)", "sistema"),
+    ("/team", "/team <agentes> <tarefa>", "Equipe de 2+ IAs colaborando (ex.: /team revisor,pesquisador crie uma API) — pode usar 'nome@model' para modelos diferentes", "sistema"),
     ("/mcp", "/mcp [nome|reload]", "Mostra os servidores MCP (ferramentas externas) e reconecta", "sistema"),
     ("/hooks", "/hooks", "Mostra os hooks configurados (~/.send/hooks.json)", "sistema"),
     ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o servidor", "sistema"),
@@ -4303,6 +4528,43 @@ def cmd_subagentes(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+def cmd_team(sess, rest, c, tools_enabled):
+    """Equipe de 2+ IAs: /team revisor,pesquisador <tarefa> [--estrategia paralelo|debate|sequencial]."""
+    if not rest.strip():
+        subagents = load_subagents()
+        if subagents:
+            names = ", ".join(s["name"] for s in subagents)
+            print(f"Subagentes disponíveis: {names}")
+        print("Uso: /team <agentes> <tarefa>")
+        print("  Ex.: /team revisor,pesquisador crie uma API de tarefas")
+        print("       /team revisor@qwen2.5-coder-7b,pesquisador --estrategia debate analise este código")
+        print("  Agentes: lista separada por vírgula, pode usar 'nome@model' para modelos diferentes (grátis local).")
+        print("  Estratégias: paralelo (padrão), debate, sequencial")
+        return False, tools_enabled
+    # parse: primeiro token é lista de agentes, resto é tarefa + possível --estrategia
+    parts = rest.split(None, 1)
+    agentes_raw = parts[0]
+    tarefa = parts[1] if len(parts) > 1 else ""
+    estrategia = "paralelo"
+    # detecta --estrategia no fim da tarefa
+    import re as _re
+    m = _re.search(r"--estrategia\s+(paralelo|debate|sequencial)\b", tarefa)
+    if m:
+        estrategia = m.group(1)
+        tarefa = _re.sub(r"--estrategia\s+(?:paralelo|debate|sequencial)\b", "", tarefa).strip()
+    agentes = [a.strip() for a in agentes_raw.split(",") if a.strip()]
+    if len(agentes) < 2:
+        print(c.yellow("Equipe precisa de pelo menos 2 agentes separados por vírgula (ex.: revisor,pesquisador)."))
+        return False, tools_enabled
+    if not tarefa.strip():
+        print(c.yellow("Informe a tarefa após os agentes (ex.: /team revisor,pesquisador crie uma API)."))
+        return False, tools_enabled
+    print()
+    print(run_team(tarefa, agentes, estrategia, c, sess.cfg))
+    print()
+    return False, tools_enabled
+
+
 def cmd_mcp(sess, rest, c, tools_enabled):
     """Mostra os servidores MCP; /mcp reload reconecta; /mcp <nome> detalha."""
     arg = rest.strip().lower()
@@ -4558,6 +4820,8 @@ def handle_command(sess, line, c, tools_enabled):
         return cmd_skills(sess, rest, c, tools_enabled)
     if cmd == "/subagentes":
         return cmd_subagentes(sess, rest, c, tools_enabled)
+    if cmd == "/team":
+        return cmd_team(sess, rest, c, tools_enabled)
     if cmd == "/mcp":
         return cmd_mcp(sess, rest, c, tools_enabled)
     if cmd == "/hooks":
