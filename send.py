@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.8.2"
+VERSION = "1.8.3"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -3586,14 +3586,14 @@ def print_help(c):
 
 
 def _read_nonblock(fd):
-    """Lê 1 byte do stdin sem bloquear; None se não houver nada.
-
-    Cobre os dois lugares onde bytes podem estar esperando: o fd (via select)
-    e os buffers internos do TextIOWrapper (via leitura com fd não-bloqueante).
-    """
+    """Lê 1 byte do stdin sem bloquear; None se não houver nada."""
     import select
     if select.select([sys.stdin], [], [], 0.0)[0]:
-        return sys.stdin.read(1)
+        try:
+            data = os.read(fd, 1)
+            return data.decode(errors="ignore") if data else None
+        except OSError:
+            return None
     try:
         import fcntl
     except ImportError:  # Windows usa o menu numerado; nunca chega aqui
@@ -3602,7 +3602,8 @@ def _read_nonblock(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
     try:
         try:
-            return sys.stdin.read(1)
+            data = os.read(fd, 1)
+            return data.decode(errors="ignore") if data else None
         except (BlockingIOError, OSError, ValueError):
             return None
     finally:
@@ -3721,7 +3722,7 @@ def show_command_menu(c, initial_query=""):
     def redraw(items, sel, query, drawn):
         lines = draw(items, sel, query, width, maxh)
         sys.stdout.write("\x1b[%dA" % drawn + "\x1b[J")
-        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.write("\r\n".join(lines) + "\r\n")
         sys.stdout.flush()
         return len(lines)
 
@@ -3746,11 +3747,16 @@ def show_command_menu(c, initial_query=""):
     try:
         tty.setraw(fd)
         lines = draw(items, sel, query, width, maxh)
-        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.write("\r\n".join(lines) + "\r\n")
         sys.stdout.flush()
         drawn = len(lines) + 1
         while True:
-            ch = sys.stdin.read(1)
+            try:
+                ch = os.read(fd, 1).decode(errors="ignore")
+            except OSError:
+                ch = ""
+            if not ch:
+                continue
             if ch in ("q", "Q", "\x03"):
                 break
             if ch in ("\r", "\t"):
@@ -4461,7 +4467,10 @@ def _input_with_instant_palette(prompt, c):
     sys.stdout.flush()
     try:
         tty.setraw(fd)
-        ch = sys.stdin.read(1)
+        try:
+            ch = os.read(fd, 1).decode(errors="ignore")
+        except OSError:
+            ch = ""
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     if ch == "/":
