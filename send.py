@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -4895,7 +4895,26 @@ def _input_with_instant_palette(prompt, c):
     if ch == "/":
         sys.stdout.write("/\r\n")
         sys.stdout.flush()
-        return show_command_menu(c)
+        # Coleta digitação rápida após / (ex: /help digitado sem pausa) para já abrir filtrado — grátis
+        initial = ""
+        try:
+            import select as _sel
+            for _ in range(16):
+                nxt = _read_nonblock(fd)
+                if nxt is None:
+                    _sel.select([sys.stdin], [], [], 0.03)
+                    nxt = _read_nonblock(fd)
+                if nxt is None:
+                    break
+                if nxt in ("\r", "\n", "\x1b", "\x7f", "\x08"):
+                    break
+                if nxt.isprintable():
+                    initial += nxt
+                else:
+                    break
+        except Exception:
+            pass
+        return show_command_menu(c, initial_query=initial)
     if ch == "\x03":
         raise KeyboardInterrupt
     if ch == "\x04":
