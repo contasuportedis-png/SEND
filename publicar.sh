@@ -128,15 +128,10 @@ git add -A
 if git diff --cached --quiet; then
   echo "ℹ Nada para commitar (código já está igual) — seguindo para tag/release."
 else
-  git commit --quiet -m "v${VER}: atualização do SEND
+  git commit --quiet -m "v${VER}: corrige paleta / que escorregava a cada tecla
 
-- Subagentes: delegação de tarefas (delegate/create_subagent; revisor, pesquisador, analista)
-- MCP: conexão com servidores externos via stdio (~/.send/mcp.json, /mcp)
-- Hooks: comandos automáticos em eventos (~/.send/hooks.json)
-- Pensamento do modelo minimizável/expansível (Enter expande, /pensamento)
-- Blocos de código em moldura com a linguagem
-- Código salvo direto no computador (pergunta antes, ou --save-code)
-- Banner ASCII, painéis, markdown colorido, ícones, spinner"
+fix: corrige bug visual no autocomplete da paleta de comandos (/)
+- Corrige cálculo de linhas redesenhadas em show_command_menu (+1 pela quebra extra antes do primeiro desenho)."
   echo "✅ Commit criado"
 fi
 git push --quiet origin main
@@ -157,19 +152,20 @@ else
     --title "SEND v${VER}" \
     --notes "## ⚡ SEND v${VER}
 
-### ✨ Novidades
-- **Subagentes**: delega tarefas a especialistas (revisor, pesquisador, analista) e cria os seus (delegate, create_subagent, /subagentes)
-- **MCP**: conecta servidores externos e usa as ferramentas deles (~/.send/mcp.json, /mcp)
-- **Hooks**: comandos automáticos em eventos (~/.send/hooks.json)
-- Pensamento do modelo minimizável/expansível (Enter expande, /pensamento)
-- Blocos de código em moldura com a linguagem
-- Código salvo direto no computador (pergunta antes, ou --save-code)
-- Banner ASCII, painéis, markdown colorido, ícones, spinner
+fix: corrige bug visual no autocomplete da paleta de comandos (/)
 
-### 🧪 Testes automatizados passando
+- Corrige cálculo de linhas redesenhadas em show_command_menu, que fazia
+  a paleta escorregar e deixar lixo visual na tela a cada tecla digitada.
 
-**Linux/Pop!_OS:** \`curl -fsSL https://github.com/contasuportedis-png/SEND/raw/main/install.sh | bash\`
-**Windows:** \`irm https://github.com/contasuportedis-png/SEND/raw/main/install.ps1 | iex\`" >/dev/null
+### Atualização
+\`\`\`bash
+send --update
+send --version
+\`\`\`
+A versão exibida deve ser \`SEND ${VER}\`.
+
+**Linux/macOS:** curl -fsSL https://github.com/contasuportedis-png/SEND/raw/main/install.sh | bash
+**Windows:** irm https://github.com/contasuportedis-png/SEND/raw/main/install.ps1 | iex" >/dev/null
   echo "✅ Release v${VER} criado"
 fi
 

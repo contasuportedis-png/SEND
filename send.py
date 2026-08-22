@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -3748,7 +3748,7 @@ def show_command_menu(c, initial_query=""):
         lines = draw(items, sel, query, width, maxh)
         sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
-        drawn = len(lines)
+        drawn = len(lines) + 1
         while True:
             ch = sys.stdin.read(1)
             if ch in ("q", "Q", "\x03"):
