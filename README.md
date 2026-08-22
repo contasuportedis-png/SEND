@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.6.0 — assistente de IA no terminal (LM Studio)
+⚡ SEND v1.7.0 — assistente de IA no terminal (LM Studio)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -391,7 +391,52 @@ send "lembre que eu uso Pop!_OS"                     # grava na memória
 > Dica: em modelos menores, desligar skills que não precisa deixa as
 > respostas mais rápidas e evita chamadas de ferramentas desnecessárias.
 
-## 🧠 Modos de uso
+## 🤖 Modo automático — o SEND escolhe o modo sozinho
+
+**Ligado por padrão.** Você não precisa alternar entre chat, coding, plan e
+workflow: o SEND analisa cada tarefa e decide sozinho:
+
+| Sua mensagem | O SEND usa |
+|---|---|
+| `oi`, `o que é um decorator?` | 💬 **chat** — só conversa |
+| `procure o arquivo config.py` | 🛠 **coding** — arquivos + terminal |
+| `planeje a refatoração do projeto` | 📋 **plan** — planeja sem executar |
+| `crie um app de tarefas completo` | 🔁 **workflow** — as 4 etapas |
+
+Você vê a escolha na hora (`↳ modo automático: 🛠 CODING …`). Se quiser forçar
+um modo, use `/code`, `/chat`, `/plan`, `/workflow` (ou as flags `--code`,
+`--plan`…) — o modo escolhido passa a valer. Para desligar a escolha
+automática:
+
+```
+/automode on|off        # ou: send --auto-mode / send --no-auto-mode
+```
+
+Além disso, o SEND **despacha subagentes automaticamente**: tarefas extensas
+ou repetitivas são delegadas sozinhas (revisor, pesquisador, analista…) com a
+ferramenta `delegate` — sem você precisar pedir.
+
+## 🔥 OUTMODE — o SEND age sem pedir autorização
+
+O OUTMODE é o modo "manda ver": o SEND **não pergunta nada** — escreve,
+edita, executa comandos, faz commit e salva código **direto**, sem pedir sua
+confirmação. Só ligue se confiar (é você quem decide):
+
+```
+/outmode on     # 🔥 ligado — age sem pedir autorização
+/outmode off    # 🔒 desligado — volta a pedir (padrão)
+```
+
+Com o OUTMODE ligado o prompt fica com um 🔥 e ele também salva os blocos de
+código sem perguntar. Em uma execução única:
+
+```bash
+send --outmode "crie um script e rode os testes"
+```
+
+> ⚠️ Use com cuidado: comandos que ele executar rodam de verdade no seu PC.
+
+## 🧠 Modos de uso (quando o automático está desligado)
 
 | Modo | Flag | O que faz |
 |---|---|---|
@@ -439,14 +484,16 @@ send --install                          # mostra como instalar em outra máquina
 
 ### Comandos dentro do SEND — paleta `/`
 
-Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa**
-(navegue com as setas ↑↓ ou digite o número, Enter executa, Esc fecha).
-Também funciona o **Tab** para autocompletar comandos.
+Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa** com
+busca — digite para filtrar (ex.: `mcp` mostra só o `/mcp`), navegue com as
+setas ↑↓ (ou 1-9), Enter executa, Esc/q fecha. Também funciona o **Tab** para
+autocompletar comandos.
 
 ```
 /help     /skills [nome] [on|off]   /memoria   /resumo   /pensamento   /clear   /exit
 /model [nome]   /models   /thinking on|off   /backend [lmstudio|ollama|url]
 /code     /chat   /plan   /workflow   /tools on|off
+/automode [on|off]   /outmode [on|off]
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
 /backups [restore n]   /contexto [on|off]   /subagentes [nome] [tarefa]
 /mcp [nome|reload]   /hooks   /update   /doctor

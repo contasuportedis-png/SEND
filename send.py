@@ -52,7 +52,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
@@ -158,7 +158,7 @@ def banner(c, model=None, mode=None):
     if mode:
         info += f"  ·  modo: {mode}"
     print(c.dim("  " + info))
-    print(c.dim("  digite / para a paleta de comandos · /help · Ctrl+C para sair"))
+    print(c.dim("  digite / + Enter para a paleta de comandos · /help · Ctrl+C para sair"))
     print()
 
 
@@ -455,7 +455,7 @@ def offer_save_code(content, c, cfg, auto_confirm, dest_dir=None):
             except Exception as e:
                 print(c.red(f"  ✗ Não foi possível salvar {target}: {e}"))
             continue
-        if not sys.stdin.isatty():
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
             continue
         try:
             r = input(c.dim(f"💾 Bloco de código ({b['lang'] or 'texto'}) — "
@@ -500,6 +500,8 @@ DEFAULT_CONFIG = {
     "auto_save_code": False,       # True = salva blocos de código sem perguntar
     "mcp_enabled": True,           # conecta servidores MCP de ~/.send/mcp.json
     "hooks": True,                 # executa hooks de ~/.send/hooks.json
+    "auto_mode": True,             # escolhe o modo sozinho (chat/coding/plan/workflow)
+    "outmode": False,              # OUTMODE: age sem pedir autorização
 }
 
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -1381,7 +1383,10 @@ CODING_SYSTEM = (
     " Você está em MODO CODING: pode usar as ferramentas disponíveis para ler "
     "arquivos, escrever arquivos, listar diretórios e executar comandos quando "
     "necessário. Prefira usar as ferramentas em vez de pedir para o usuário "
-    "fazer. Nunca invente o conteúdo de arquivos que você não leu."
+    "fazer. Nunca invente o conteúdo de arquivos que você não leu. "
+    "Para tarefas extensas, repetitivas ou que podem rodar em paralelo, "
+    "DESPACHE subagentes automaticamente com a ferramenta 'delegate' "
+    "(ex.: revisor, pesquisador, analista) em vez de fazer tudo sozinho."
 )
 
 PLAN_SYSTEM = (
@@ -2597,6 +2602,8 @@ class Session:
         self.messages = []
         self.model_id = None
         self.summary = None   # resumo de conversas anteriores (auto-summarize)
+        self.mode_override = None   # modo fixo escolhido pelo usuário
+        self.outmode_prev = None    # estado anterior (para /outmode off)
 
 
 # Limite de mensagens antes de resumir a conversa automaticamente
@@ -2842,6 +2849,89 @@ def ask_model(sess, tools_enabled, c, auto_confirm):
 
 
 # ---------------------------------------------------------------------------
+# Modo automático — o SEND escolhe o modo ideal para cada tarefa
+# ---------------------------------------------------------------------------
+
+MODE_LABELS = {
+    "chat": "💬 CHAT (só conversa)",
+    "coding": "🛠 CODING (arquivos + terminal)",
+    "plan": "📋 PLAN (planejar sem executar)",
+    "workflow": "🔁 WORKFLOW (4 etapas)",
+}
+
+# Indícios de tarefa grande → workflow
+_WF_HINTS = (
+    "app", "aplicativo", "projeto", "site", "sistema", "api", "jogo",
+    "dashboard", "backend", "frontend", "módulo", "modulo", "pipeline",
+    "do zero", "completo", "completa", "integrado", "automatize",
+    "automatizar", "automação", "automatizacao",
+)
+# Ação forte = o usuário mandou construir/fazer algo
+_STRONG_ACTION = (
+    "crie", "cria", "criar", "criado", "construa", "construir", "desenvolva",
+    "desenvolver", "implemente", "implementar", "faça", "faca", "fazer",
+    "monte", "montei", "refatore", "refatorar", "automatize", "monte um",
+)
+# Pedido explícito de plano → plan
+_PLAN_HINTS = (
+    "planej", "plano", "planeje", "estratégia", "estrategia", "roadmap",
+    "passo a passo", "roteiro", "arquitetura", "como devo", "qual a melhor",
+    "que passos", "me dê um plano", "me de um plano", "divida a tarefa",
+)
+# Início de pergunta simples → chat
+_CHAT_STARTS = (
+    "o que", "oq", "qual", "quem", "quando", "onde", "por que", "porque",
+    "pq", "explique", "me explica", "como funciona", "o que é", "oq e",
+    "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem",
+    "obrigado", "obrigada", "valeu", "tchau", "ajuda",
+)
+_CODING_HINTS = (
+    "script", "codigo", "código", "arquivo", "função", "funcao", "classe",
+    "bug", "erro", "teste", "rode", "execute", "procure", "liste",
+    "edite", "escreva", "corrija", "renomeie", "ordene", "compile",
+)
+
+
+def detect_mode(prompt):
+    """Escolhe o modo ideal para um prompt (chat/coding/plan/workflow)."""
+    p = (prompt or "").strip().lower()
+    if not p:
+        return "chat"
+    # Pergunta/conversa simples → chat
+    if len(p) < 160 and p.startswith(_CHAT_STARTS):
+        return "chat"
+    # Pedido explícito de plano → plan
+    if any(h in p for h in _PLAN_HINTS):
+        return "plan"
+    strong = any(a in p for a in _STRONG_ACTION)
+    wf = any(w in p for w in _WF_HINTS)
+    # Tarefa grande (ação forte + escopo) ou pedido grande → workflow
+    if wf and (strong or len(p) >= 90):
+        return "workflow"
+    # Tarefa de código → coding
+    if strong or any(h in p for h in _CODING_HINTS):
+        return "coding"
+    # Frase curta genérica → chat; mais longa → coding (tem ferramentas)
+    return "chat" if len(p) < 60 else "coding"
+
+
+def effective_mode(sess, prompt):
+    """Modo efetivo para a tarefa. Retorna (modo, foi_auto?).
+
+    - auto_mode ligado e sem modo fixo escolhido → detecta por tarefa
+    - modo fixo escolhido (/code, --plan, /workflow…) → respeita
+    - auto_mode desligado → usa o modo da config
+    """
+    cfg = sess.cfg
+    if not cfg.get("auto_mode", True):
+        return cfg.get("mode", "coding"), False
+    ov = getattr(sess, "mode_override", None)
+    if ov:
+        return ov, False
+    return detect_mode(prompt), True
+
+
+# ---------------------------------------------------------------------------
 # Workflow: Planejar → Construir → Verificar → Corrigir
 # ---------------------------------------------------------------------------
 
@@ -3058,6 +3148,8 @@ COMMANDS = [
     ("/chat", "/chat", "Modo chat: só conversa, sem ferramentas", "modo"),
     ("/plan", "/plan", "Modo plano: só planeja, não executa nada", "modo"),
     ("/workflow", "/workflow", "Modo workflow: Planejar → Construir → Verificar → Corrigir", "modo"),
+    ("/automode", "/automode [on|off]", "Modo automático: o SEND escolhe chat/coding/plan/workflow sozinho", "modo"),
+    ("/outmode", "/outmode [on|off]", "🔥 OUTMODE: age sem pedir autorização (escreve, executa, commita sozinho)", "modo"),
     ("/tools", "/tools [on|off]", "Liga/desliga as ferramentas manualmente", "modo"),
     ("/status", "/status", "Mostra o estado da sessão", "sessão"),
     ("/config", "/config [chave] [valor]", "Mostra ou altera a configuração", "sessão"),
@@ -3097,17 +3189,20 @@ HELP_TEXT = build_help_text()
 def print_help(c):
     """Ajuda bonita, organizada por categoria com cores."""
     print()
-    panel("⚡ SEND — AJUDA", "digite / e Enter para abrir a paleta interativa", c,
-           width=74)
-    for cat in COMMAND_CATEGORIES:
+    panel("⚡ SEND — AJUDA", "digite / + Enter para a paleta interativa "
+          "(com busca)", c, width=74)
+    for cat, cmds in _command_groups():
+        if not cmds:
+            continue
         print()
-        print(c.bold(c.cyan("  " + cat.upper())))
-        for name, syntax, desc, ccat in COMMANDS:
-            if ccat == cat:
-                print(f"    {c.bold(syntax):<38} {c.dim(desc)}")
+        print(c.bold(c.magenta("  ◆ " + cat.upper())))
+        for name, syntax, desc in cmds:
+            syn = syntax[:38].ljust(38)
+            print(f"    {c.bold(syn)} {c.dim(desc)}")
     print()
-    print(c.bold(c.cyan("  DICAS")))
-    print(c.dim("    • digite / e Enter → paleta de comandos interativa (setas ↑↓)"))
+    print(c.bold(c.magenta("  DICAS")))
+    print(c.dim("    • digite / + Enter → paleta interativa (digite para "
+                "filtrar, ↑↓, Enter)"))
     print(c.dim("    • Tab completa comandos e caminhos de arquivos"))
     print(c.dim("    • use \\ no fim da linha para continuar em outra linha"))
     print(c.dim("    • Ctrl+C interrompe a resposta; Ctrl+C de novo sai"))
@@ -3138,123 +3233,209 @@ def _read_nonblock(fd):
         fcntl.fcntl(fd, fcntl.F_SETFL, flags)
 
 
-def show_command_menu(c):
-    """Paleta de comandos interativa (setas ↑↓ + Enter). Retorna o comando
-    escolhido ou None se cancelado."""
-    flat = []
-    for cat in COMMAND_CATEGORIES:
-        flat.append(("cat", cat))
-        for name, syntax, desc, ccat in COMMANDS:
-            if ccat == cat:
-                flat.append(("cmd", name, syntax, desc))
+def _command_groups():
+    """Retorna [(categoria, [(nome, sintaxe, descrição), ...]), ...]."""
+    return [(cat, [(n, s, d) for n, s, d, cc in COMMANDS if cc == cat])
+            for cat in COMMAND_CATEGORIES]
 
-    def draw(idx):
-        out = []
-        for i, item in enumerate(flat):
-            if item[0] == "cat":
-                out.append(c.bold(c.magenta("  " + item[1].upper())))
-            else:
-                marker = c.bold(c.cyan("❯")) if i == idx else " "
-                line = f" {marker} {item[2]:<34} {c.dim(item[3])}"
-                if i == idx and c.enabled:
-                    line = "\033[48;5;24m" + line + "\033[0m"
-                out.append(line)
-        return out
+
+def _menu_fallback(c):
+    """Paleta numerada para Windows / terminal não-interativo."""
+    print()
+    panel("⚡ COMANDOS DO SEND",
+          "digite o número do comando e Enter · Enter vazio cancela", c,
+          width=74)
+    nums = []
+    n = 1
+    for cat, cmds in _command_groups():
+        if not cmds:
+            continue
+        print(c.bold(c.magenta("  ◆ " + cat.upper())))
+        for name, syntax, desc in cmds:
+            syn = syntax[:34].ljust(34)
+            print(f"   {n:>2}. {c.bold(syn)} {c.dim(desc)}")
+            nums.append((n, name))
+            n += 1
+    print()
+    try:
+        r = input(c.dim("  Escolha um número (Enter cancela): ")).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    if not r:
+        return None
+    for num, name in nums:
+        if str(num) == r:
+            return name
+    print(c.yellow(f"  Número inválido: {r}"))
+    return None
+
+
+def show_command_menu(c):
+    """Paleta de comandos interativa: digite para filtrar, ↑↓ navega,
+    Enter executa, Esc/q fecha. Retorna o comando ou None se cancelado."""
+    groups = _command_groups()
 
     # Fallback para Windows/sem TTY: lista numerada
     if os.name == "nt" or not sys.stdin.isatty():
-        print(c.bold("Comandos do SEND:"))
-        nums = []
-        n = 1
-        for i, item in enumerate(flat):
-            if item[0] == "cat":
-                print(c.cyan(c.bold("  " + item[1].upper())))
-            else:
-                print(f"  {n}. {item[2]:<34} {c.dim(item[3])}")
-                nums.append((n, item[1]))
-                n += 1
-        print()
-        try:
-            r = input(c.dim("Escolha um número (Enter para cancelar): ")).strip()
-            if not r:
-                return None
-            for num, name in nums:
-                if str(num) == r:
-                    return name
-            print(c.yellow(f"Número inválido: {r}"))
-            return None
-        except (EOFError, KeyboardInterrupt):
-            return None
+        return _menu_fallback(c)
 
     import select
     import termios
     import tty
 
-    idx = 1  # primeiro comando (índice 0 é o cabeçalho da 1ª categoria)
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    sys.stdout.write("\n" + c.bold(c.cyan("  ⚡ COMANDOS — ↑↓ navegar · Enter executar · Esc/q fechar")) + "\n\n")
-    try:
-        tty.setraw(fd)
-        lines = draw(idx)
+    def matches(query, name, syntax, desc):
+        if not query:
+            return True
+        q = query.strip().lower()
+        hay = f"{name} {syntax} {desc}".lower()
+        return all(part in hay for part in q.split())
+
+    def build(query):
+        items = []  # ("cat", nome) ou ("cmd", nome, sintaxe, desc)
+        for cat, cmds in groups:
+            vis = [cmd for cmd in cmds if matches(query, *cmd)]
+            if vis:
+                items.append(("cat", cat))
+                items.extend(("cmd",) + cmd for cmd in vis)
+        return items
+
+    def draw(items, sel, query, width, maxh):
+        out = []
+        title = "  ⚡ COMANDOS DO SEND  "
+        if query:
+            title += "🔍 " + query + "▌"
+        out.append(c.bold(c.cyan(title)))
+        if query:
+            hint = "  ↑↓ navegar · Enter executar · Esc/q fechar"
+        else:
+            hint = "  digite para filtrar · ↑↓ navegar · Enter executar · Esc/q fechar"
+        out.append(c.dim(hint))
+        out.append("")
+        max_desc = max(6, width - 47)
+        # janela de rolagem em volta do item selecionado
+        top = 0
+        if len(items) > maxh:
+            top = max(0, min(sel - maxh // 2, len(items) - maxh))
+        for i, it in enumerate(items[top:top + maxh], start=top):
+            if it[0] == "cat":
+                out.append(c.bold(c.magenta("  ◆ " + it[1].upper())))
+            else:
+                _, name, syntax, desc = it
+                syn = syntax[:38].ljust(38)
+                d = desc[:max_desc]
+                if len(desc) > max_desc:
+                    d = d[:max(0, max_desc - 1)] + "…"
+                mark = "❯" if i == sel else " "
+                if i == sel:
+                    out.append("\033[48;5;26;1m " + mark + " " + syn + " " + d
+                               + "\033[0m")
+                else:
+                    out.append(" " + mark + " " + c.bold(syn) + " " + c.dim(d))
+        if len(items) > maxh:
+            out.append(c.dim(f"  … {len(items) - maxh} comando(s) acima/abaixo — "
+                             f"filtrando ({len(items)} total)"))
+        return out
+
+    def redraw(items, sel, query, drawn):
+        lines = draw(items, sel, query, width, maxh)
+        sys.stdout.write("\x1b[%dA" % drawn + "\x1b[J")
         sys.stdout.write("\n".join(lines) + "\n")
         sys.stdout.flush()
+        return len(lines)
+
+    fd = sys.stdin.fileno()
+    try:
+        old = termios.tcgetattr(fd)
+    except Exception:
+        # terminal sem termios (ex.: alguns emuladores/ssh) → fallback numerado
+        return _menu_fallback(c)
+    size = shutil.get_terminal_size((100, 24))
+    width = max(60, min(140, size.columns))
+    maxh = max(6, size.lines - 8)
+
+    query = ""
+    items = build(query)
+    sel = 0
+    while items and items[sel][0] != "cmd":
+        sel += 1
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    try:
+        tty.setraw(fd)
+        lines = draw(items, sel, query, width, maxh)
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        drawn = len(lines)
         while True:
             ch = sys.stdin.read(1)
             if ch in ("q", "Q", "\x03"):
-                sys.stdout.write("\r\n")
-                sys.stdout.flush()
-                return None
+                break
             if ch == "\r":
-                sys.stdout.write("\r\n")
-                sys.stdout.flush()
-                selected = flat[idx]
-                return selected[1] if selected[0] == "cmd" else None
+                if items and items[sel][0] == "cmd":
+                    name = items[sel][1]
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return name
+                break  # Enter sem seleção → fecha
             if ch == "\x1b":
-                # ESC pode ser sozinho (cancelar) ou início de seta (ESC [ A/B)
                 seq = ""
                 for _ in range(2):
                     b = _read_nonblock(fd)
                     if b is None:
-                        # espera um pouco (entrega atrasada do terminal)
                         select.select([sys.stdin], [], [], 0.3)
                         b = _read_nonblock(fd)
                     if b is None:
                         break
                     seq += b
-                if seq == "[A":
-                    idx = (idx - 1) % len(flat)
-                    while flat[idx][0] != "cmd":
-                        idx = (idx - 1) % len(flat)
-                elif seq == "[B":
-                    idx = (idx + 1) % len(flat)
-                    while flat[idx][0] != "cmd":
-                        idx = (idx + 1) % len(flat)
+                if seq == "[A" and items:
+                    sel = (sel - 1) % len(items)
+                    while items[sel][0] != "cmd":
+                        sel = (sel - 1) % len(items)
+                elif seq == "[B" and items:
+                    sel = (sel + 1) % len(items)
+                    while items[sel][0] != "cmd":
+                        sel = (sel + 1) % len(items)
                 elif seq in ("[C", "[D"):
                     pass
                 else:
-                    sys.stdout.write("\r\n")
-                    sys.stdout.flush()
-                    return None
+                    break  # ESC sozinho → cancela
+            elif ch in ("\x7f", "\x08"):
+                if query:
+                    query = query[:-1]
+                    items = build(query)
+                    sel = 0
+                    while items and items[sel][0] != "cmd":
+                        sel += 1
             elif ch.isdigit():
-                # atalho por número (1-9)
+                nums = [i for i, it in enumerate(items) if it[0] == "cmd"]
                 num = int(ch)
-                cmd_items = [i for i in flat if i[0] == "cmd"]
-                if 1 <= num <= len(cmd_items):
+                if 1 <= num <= len(nums):
+                    name = items[nums[num - 1]][1]
                     sys.stdout.write("\r\n")
                     sys.stdout.flush()
-                    return cmd_items[num - 1][1]
-            sys.stdout.write("\r\x1b[K" + ("\x1b[1A\r\x1b[K" * (len(flat) + 2)))
-            lines = draw(idx)
-            sys.stdout.write("\n".join(lines) + "\n")
-            sys.stdout.flush()
+                    return name
+            elif ch.isprintable():
+                query += ch
+                items = build(query)
+                sel = 0
+                while items and items[sel][0] != "cmd":
+                    sel += 1
+            drawn = redraw(items, sel, query, drawn)
     except (KeyboardInterrupt, EOFError):
-        return None
+        pass
     finally:
         try:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
             pass
+        try:
+            sys.stdout.write("\x1b[%dA" % drawn + "\x1b[J")
+        except Exception:
+            pass
+        sys.stdout.write("\r\n")
+        sys.stdout.flush()
+    return None
 
 
 def _skill_known(name):
@@ -3269,6 +3450,7 @@ EDITABLE_CONFIG = {
     "thinking": bool, "reasoning_effort": str, "show_reasoning": bool,
     "auto_confirm": bool, "auto_backend": bool, "project_context": bool,
     "auto_summarize": bool, "mode": str, "mcp_enabled": bool, "hooks": bool,
+    "auto_mode": bool, "outmode": bool,
 }
 
 
@@ -3604,21 +3786,25 @@ def handle_command(sess, line, c, tools_enabled):
         return False, tools_enabled
     if cmd == "/code":
         cfg["mode"] = "coding"
+        sess.mode_override = "coding"
         save_config(cfg)
         print("🛠 Modo coding ativado (ferramentas disponíveis).")
         return False, True
     if cmd == "/chat":
         cfg["mode"] = "chat"
+        sess.mode_override = "chat"
         save_config(cfg)
         print("💬 Modo chat ativado (sem ferramentas).")
         return False, False
     if cmd == "/plan":
         cfg["mode"] = "plan"
+        sess.mode_override = "plan"
         save_config(cfg)
         print("📋 Modo plano ativado (só planeja, não executa).")
         return False, False
     if cmd == "/workflow":
         cfg["mode"] = "workflow"
+        sess.mode_override = "workflow"
         save_config(cfg)
         print("🔁 Modo workflow ativado: cada tarefa passa pelas 4 etapas")
         print("   📋 Planejar → 🔨 Construir → ✅ Verificar → 🔧 Corrigir")
@@ -3681,6 +3867,46 @@ def handle_command(sess, line, c, tools_enabled):
             print(f"🧠 Pensamento: {'ligado' if cfg['thinking'] else 'desligado'} "
                   f"(use /thinking on ou /thinking off)")
         return False, tools_enabled
+    if cmd == "/automode":
+        if rest in ("on", "off"):
+            cfg["auto_mode"] = rest == "on"
+            save_config(cfg)
+            if cfg["auto_mode"]:
+                print("🤖 Modo automático LIGADO — o SEND escolhe sozinho "
+                      "entre chat, coding, plan e workflow para cada tarefa.")
+            else:
+                print(f"🤖 Modo automático desligado — usando o modo fixo "
+                      f"'{cfg['mode']}'. Reative com /automode on.")
+        else:
+            print(f"🤖 Modo automático: "
+                  f"{'ligado' if cfg.get('auto_mode', True) else 'desligado'} "
+                  f"(use /automode on|off)")
+        return False, tools_enabled
+    if cmd == "/outmode":
+        if rest in ("on", "off"):
+            on = rest == "on"
+            cfg["outmode"] = on
+            save_config(cfg)
+            if on:
+                sess.outmode_prev = (bool(cfg.get("auto_confirm")),
+                                     bool(cfg.get("auto_save_code")))
+                sess.auto_confirm = True
+                cfg["auto_save_code"] = True
+                print("🔥 OUTMODE LIGADO — o SEND vai AGIR SEM PEDIR "
+                      "AUTORIZAÇÃO: escrever/editar arquivos, executar "
+                      "comandos, commitar e salvar código sozinho. "
+                      "Desligue com /outmode off.")
+            else:
+                sess.auto_confirm = bool(cfg.get("auto_confirm"))
+                if sess.outmode_prev:
+                    cfg["auto_save_code"] = sess.outmode_prev[1]
+                    sess.outmode_prev = None
+                print("🔒 OUTMODE desligado — o SEND volta a pedir "
+                      "autorização antes de agir.")
+        else:
+            print(f"🔥 OUTMODE: {'ligado' if cfg.get('outmode') else 'desligado'} "
+                  f"(use /outmode on|off)")
+        return False, tools_enabled
     if cmd == "/tools":
         if rest in ("on", "off"):
             on = rest == "on"
@@ -3699,6 +3925,8 @@ def handle_command(sess, line, c, tools_enabled):
             f"Modo         : {cfg['mode']}",
             f"Ferramentas  : {'✅ sim' if tools_enabled else '⛔ não'}",
             f"Pensamento   : {'✅ sim' if cfg['thinking'] else '⛔ não'}",
+            f"Modo auto    : {'✅ sim' if cfg.get('auto_mode', True) else '⛔ não'}",
+            f"OUTMODE      : {'🔥 sim' if cfg.get('outmode') else '⛔ não'}",
             f"Skills       : {', '.join(skills) if skills else 'nenhuma'}",
             f"MCP          : {mcp_summary(cfg)}",
             f"Config       : {CONFIG_PATH}",
@@ -3783,18 +4011,21 @@ def make_prompt(c, sess):
     mode_icons = {"CODING": "🛠", "CHAT": "💬", "PLAN": "📋", "WORKFLOW": "🔁"}
     mi = mode_icons.get(mode, "❯")
     think = " 🧠" if sess.cfg["thinking"] else ""
+    out = " 🔥" if sess.cfg.get("outmode") else ""
     if c.enabled:
         prompt = (f"{c.bold(c.cyan('send'))}{c.dim('(' + badge + '·')}"
-                  f"{mi}{c.dim(mode + ')')}{think} {c.bold('❯')} ")
+                  f"{mi}{c.dim(mode + ')')}{think}{out} {c.bold('❯')} ")
         return _rl_prompt(prompt)
-    return f"send({badge}·{mode}){think} ❯ "
+    return f"send({badge}·{mode}){think}{out} ❯ "
 
 
 def repl(sess, c, tools_enabled):
     cfg = sess.cfg
     print()
+    show_mode = ("auto" if (cfg.get("auto_mode", True)
+                            and sess.mode_override is None) else cfg["mode"])
     banner(c, model=(sess.model_id or cfg.get("model") or "auto"),
-           mode=cfg["mode"])
+           mode=show_mode)
     run_hooks("SessionStart", c, sess.cfg, prompt="modo interativo")
 
     if readline:
@@ -3836,7 +4067,10 @@ def repl(sess, c, tools_enabled):
             except Exception:
                 pass
 
-        if cfg["mode"] == "workflow":
+        modo, is_auto = effective_mode(sess, line)
+        if is_auto:
+            print(c.dim("  ↳ modo automático: ") + MODE_LABELS.get(modo, modo))
+        if modo == "workflow":
             save_history([{"role": "user", "content": line}])
             try:
                 run_workflow(sess, line, c, cfg)
@@ -3855,11 +4089,13 @@ def repl(sess, c, tools_enabled):
                 print(c.red(f"✗ Erro: {e}"))
             continue
 
+        old_mode = cfg["mode"]
+        cfg["mode"] = modo
         sess.messages.append({"role": "user", "content": line})
         save_history([{"role": "user", "content": line}])
         t0 = time.time()
         try:
-            content = ask_model(sess, tools_enabled and cfg["mode"] != "plan", c,
+            content = ask_model(sess, (modo in ("coding", "workflow")) and tools_enabled, c,
                                 getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         except urllib.error.URLError as e:
             nice_error(c, "Servidor offline",
@@ -3882,6 +4118,8 @@ def repl(sess, c, tools_enabled):
                 show_thinking_panel(sess, c, cfg)
                 offer_save_code(content, c, cfg,
                                 getattr(sess, "auto_confirm", cfg["auto_confirm"]))
+        finally:
+            cfg["mode"] = old_mode
         if sess.messages and sess.messages[-1]["role"] == "assistant":
             save_history([sess.messages[-1]])
         hr(c)
@@ -3905,7 +4143,10 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
         print(c.yellow('Nenhum prompt. Use: send "sua pergunta" — ou rode só "send" '
                        "para o modo interativo."))
         return 1
-    if sess.cfg["mode"] == "workflow":
+    modo, is_auto = effective_mode(sess, prompt)
+    if is_auto:
+        print(c.dim("  ↳ modo automático: ") + MODE_LABELS.get(modo, modo))
+    if modo == "workflow":
         save_history([{"role": "user", "content": prompt}])
         try:
             run_workflow(sess, prompt, c, sess.cfg)
@@ -3927,11 +4168,13 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
         return 0
 
     run_hooks("SessionStart", c, sess.cfg, prompt=prompt[:200])
+    old_mode = sess.cfg["mode"]
+    sess.cfg["mode"] = modo
     sess.messages.append({"role": "user", "content": prompt})
     save_history([{"role": "user", "content": prompt}])
     t0 = time.time()
     try:
-        content = ask_model(sess, tools_enabled and sess.cfg["mode"] != "plan",
+        content = ask_model(sess, (modo in ("coding", "workflow")) and tools_enabled,
                             c, auto_confirm)
     except urllib.error.URLError as e:
         nice_error(c, "Servidor offline",
@@ -3955,6 +4198,8 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
             print(c.dim(f"    ⏱ {dt:.1f}s · ≈{tokens} tokens"))
             show_thinking_panel(sess, c, sess.cfg)
             offer_save_code(content, c, sess.cfg, auto_confirm)
+    finally:
+        sess.cfg["mode"] = old_mode
     if sess.messages and sess.messages[-1]["role"] == "assistant":
         save_history([sess.messages[-1]])
     run_hooks("SessionEnd", c, sess.cfg)
@@ -4101,6 +4346,14 @@ def parse_args(argv=None):
                          "automaticamente (sem perguntar)")
     ap.add_argument("--no-tools", action="store_true",
                     help="desativa as ferramentas nesta sessão")
+    ap.add_argument("--auto-mode", dest="auto_mode", action="store_true",
+                    help="liga o modo automático (o SEND escolhe "
+                         "chat/coding/plan/workflow sozinho)")
+    ap.add_argument("--no-auto-mode", dest="auto_mode", action="store_false",
+                    help="desliga o modo automático (usa o modo fixo)")
+    ap.add_argument("--outmode", action="store_true",
+                    help="liga o OUTMODE: age sem pedir autorização")
+    ap.set_defaults(auto_mode=None)
     ap.add_argument("--temperature", type=float,
                     help="temperatura do modelo (padrão: 0.7)")
     ap.add_argument("--models", action="store_true",
@@ -4143,14 +4396,21 @@ def main(argv=None):
         cfg["reasoning_effort"] = args.reasoning_effort
     if args.temperature is not None:
         cfg["temperature"] = args.temperature
+    mode_explicit = None
     if args.code:
         cfg["mode"] = "coding"
+        mode_explicit = "coding"
     elif args.plan:
         cfg["mode"] = "plan"
+        mode_explicit = "plan"
     elif args.workflow:
         cfg["mode"] = "workflow"
+        mode_explicit = "workflow"
     elif args.chat:
         cfg["mode"] = "chat"
+        mode_explicit = "chat"
+    if args.auto_mode is not None:
+        cfg["auto_mode"] = args.auto_mode
 
     if args.models:
         try:
@@ -4192,11 +4452,25 @@ def main(argv=None):
     if cfg.get("mcp_enabled", True):
         mcp_start_all(c)
 
-    tools_enabled = (cfg["mode"] in ("coding", "workflow")) and not args.no_tools
+    sess.mode_override = mode_explicit
+    if args.no_tools:
+        tools_enabled = False
+    elif cfg.get("auto_mode", True) and mode_explicit is None:
+        # modo automático: ferramentas podem ser necessárias em qualquer modo
+        tools_enabled = True
+    else:
+        tools_enabled = cfg["mode"] in ("coding", "workflow")
 
     # -y vale só para esta sessão (não vai para a config salva)
     sess.auto_confirm = bool(args.yes) or bool(cfg["auto_confirm"])
     if args.save_code:
+        cfg["auto_save_code"] = True
+    if args.outmode:
+        cfg["outmode"] = True
+    if cfg.get("outmode"):
+        # OUTMODE: age sem pedir autorização e salva código sem perguntar
+        sess.outmode_prev = (sess.auto_confirm, bool(cfg.get("auto_save_code")))
+        sess.auto_confirm = True
         cfg["auto_save_code"] = True
 
     prompt = " ".join(args.prompt).strip()

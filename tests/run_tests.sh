@@ -3,6 +3,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# IMPORTANTE: fecha o stdin da suíte inteira. Assim, mesmo rodando dentro de
+# um terminal interativo (ex.: via publicar.sh), nenhum `input()` do SEND
+# fica esperando resposta do usuário — os testes nunca travam.
+exec < /dev/null
+
+# Captura tudo num log: no final, qualquer Traceback (mesmo em testes cujo
+# erro é mascarado por `&& echo OK`) faz a suíte falhar de verdade.
+_TEST_LOG="$(mktemp)"
+exec > >(tee "$_TEST_LOG") 2>&1
+
 echo "== 1. Sintaxe =="
 python3 -m py_compile send.py
 bash -n install.sh
@@ -12,10 +22,15 @@ echo "== 2. Versão =="
 python3 send.py --version
 
 echo "== 3. Mock do LM Studio =="
-python3 tests/mock_lmstudio.py &
-MOCK_PID=$!
-trap 'kill $MOCK_PID 2>/dev/null || true' EXIT
-sleep 1
+MOCK_PID=""
+if curl -s --max-time 1 http://127.0.0.1:1234/v1/models 2>/dev/null | grep -q '"qwen2.5-coder-7b"'; then
+  echo "Mock já ativo na porta 1234 — reutilizando"
+else
+  python3 tests/mock_lmstudio.py &
+  MOCK_PID=$!
+  sleep 1
+fi
+trap 'if [ -n "$MOCK_PID" ]; then kill $MOCK_PID 2>/dev/null || true; fi' EXIT
 
 export SEND_HOME="$(mktemp -d)"
 
@@ -26,28 +41,28 @@ echo "== 5. --models =="
 python3 send.py --models
 
 echo "== 6. Resposta única =="
-python3 send.py "oi, tudo bem?" | grep -q "Olá! Este é o modelo simulado" && echo "OK"
+python3 send.py "oi, tudo bem?" < /dev/null > /tmp/send_t6.log 2>&1 && grep -q "Olá! Este é o modelo simulado" /tmp/send_t6.log && echo "OK"
 
 echo "== 7. Tool call (read_file, -y) =="
-python3 send.py -y "leia o arquivo README.md e me diga o que ele contem" | grep -q "Resultado da ferramenta" && echo "OK"
+python3 send.py -y "leia o arquivo README.md e me diga o que ele contem" < /dev/null > /tmp/send_t7.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t7.log && echo "OK"
 
 echo "== 8. Tool call web_search =="
-python3 send.py -y "pesquise na internet" | grep -q "Resultado da ferramenta" && echo "OK"
+python3 send.py -y "pesquise na internet" < /dev/null > /tmp/send_t8.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t8.log && echo "OK"
 
 echo "== 9. Tool call system_info =="
-python3 send.py -y "informacoes do pc" | grep -q "Resultado da ferramenta" && echo "OK"
+python3 send.py -y "informacoes do pc" < /dev/null > /tmp/send_t9.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t9.log && echo "OK"
 
 echo "== 10. Tool call edit_file =="
-python3 send.py -y "edite o arquivo" | grep -q "Resultado da ferramenta" && echo "OK"
+python3 send.py -y "edite o arquivo" < /dev/null > /tmp/send_t10.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t10.log && echo "OK"
 
 echo "== 11. Tool call find_files =="
-python3 send.py -y "procure" | grep -q "Resultado da ferramenta" && echo "OK"
+python3 send.py -y "procure" < /dev/null > /tmp/send_t11.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t11.log && echo "OK"
 
 echo "== 12. Modo plano =="
-python3 send.py --plan "faca um plano" | grep -q "PLANO" && echo "OK"
+python3 send.py --plan "faca um plano" < /dev/null > /tmp/send_t12.log 2>&1 && grep -q "PLANO" /tmp/send_t12.log && echo "OK"
 
 echo "== 13. Pensamento (thinking) =="
-python3 send.py --thinking "teste" | grep -q "modelo simulado" && echo "OK"
+python3 send.py --thinking "teste" < /dev/null > /tmp/send_t13.log 2>&1 && grep -q "modelo simulado" /tmp/send_t13.log && echo "OK"
 
 echo "== 14. Skills na config =="
 python3 - <<'PY' && echo "OK"
@@ -58,16 +73,16 @@ import send
 cfg = send.load_config()
 assert set(cfg["skills"]) == set(send.SKILL_ORDER), cfg["skills"]
 tools = send.TOOLS
-assert len(tools) == 20, len(tools)
+assert len(tools) == 22, len(tools)
 ALLOWED = {"read_file","write_file","edit_file","list_files","find_files",
            "run_command","web_search","fetch_url","system_info","open_file",
            "open_url","git_status","git_log","git_diff","git_commit",
            "list_processes","kill_process","read_memory","remember",
-           "create_skill"}
+           "create_skill", "delegate", "create_subagent"}
 for t in tools:
     assert t["function"]["name"] in ALLOWED, t["function"]["name"]
     assert t["skill"] in send.SKILLS
-print("   20 ferramentas com skill OK")
+print("   22 ferramentas com skill OK")
 PY
 
 echo "== 15. Filtro de skills no payload =="
@@ -83,7 +98,7 @@ print("   payload com apenas run_command OK")
 PY
 
 echo "== 16. Workflow (4 etapas) =="
-python3 send.py --workflow -y "crie um app simples" > /tmp/send_wf_test.txt 2>&1
+python3 send.py --workflow -y "crie um app simples" < /dev/null > /tmp/send_wf_test.txt 2>&1
 grep -q "ETAPA 1/4 — PLANEJAR" /tmp/send_wf_test.txt && \
   grep -q "VERIFICAÇÃO OK" /tmp/send_wf_test.txt && echo "OK"
 
@@ -359,7 +374,97 @@ print("   hooks OK")
 PY
 
 echo "== 31. Delegação E2E via mock (subagente roda e devolve) =="
-SEND_HOME=$(mktemp -d) python3 send.py "delegue a revisao do codigo" 2>&1 | grep -q "🤖 subagente revisor" && echo "OK"
+SEND_HOME=$(mktemp -d) python3 send.py "delegue a revisao do codigo" < /dev/null > /tmp/send_t31.log 2>&1 || true
+grep -q "🤖 subagente revisor" /tmp/send_t31.log && echo "OK"
+
+echo "== 32. Paleta de comandos (fallback sem TTY) =="
+python3 - <<'PY' && echo "OK"
+import builtins, sys
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+captured = {}
+def fake_input(prompt=""):
+    captured["prompt"] = prompt
+    return "5"
+orig = builtins.input
+builtins.input = fake_input
+try:
+    choice = send.show_command_menu(c)
+finally:
+    builtins.input = orig
+assert choice in [cmd[0] for cmd in send.COMMANDS], choice
+assert "Escolha um número" in captured["prompt"]
+print("   paleta fallback OK")
+PY
+
+echo "== 33. Modo automático: detecção por tarefa =="
+python3 - <<'PY' && echo "OK"
+import sys
+sys.path.insert(0, ".")
+import send
+d = send.detect_mode
+cases = [
+    ("oi, tudo bem?", "chat"),
+    ("o que é um decorator em Python?", "chat"),
+    ("crie um app de tarefas completo", "workflow"),
+    ("desenvolva um site com backend e frontend", "workflow"),
+    ("planeje a refatoração do projeto", "plan"),
+    ("procure o arquivo config.py no projeto", "coding"),
+    ("crie um script que ordene uma lista", "coding"),
+    ("liste os arquivos da pasta", "coding"),
+]
+for prompt, esperado in cases:
+    assert d(prompt) == esperado, (prompt, d(prompt))
+cfg = send.load_config()
+c = send.make_colors()
+sess = send.Session(cfg, c)
+m, auto = send.effective_mode(sess, "crie um app de tarefas completo")
+assert m == "workflow" and auto is True
+sess.mode_override = "coding"
+m, auto = send.effective_mode(sess, "oi")
+assert m == "coding" and auto is False
+sess.mode_override = None
+cfg["auto_mode"] = False
+m, auto = send.effective_mode(sess, "crie um app")
+assert m == cfg["mode"] and auto is False
+cfg["auto_mode"] = True
+print("   detecção de modo OK")
+PY
+
+echo "== 34. /automode e /outmode =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+cfg = send.load_config()
+assert cfg.get("auto_mode") is True
+sess = send.Session(cfg, c)
+send.handle_command(sess, "/automode off", c, True)
+assert cfg["auto_mode"] is False
+send.handle_command(sess, "/automode on", c, True)
+assert cfg["auto_mode"] is True
+send.handle_command(sess, "/outmode on", c, True)
+assert cfg["outmode"] is True
+assert sess.auto_confirm is True
+assert cfg["auto_save_code"] is True
+assert "🔥" in send.make_prompt(c, sess)
+send.handle_command(sess, "/outmode off", c, True)
+assert cfg["outmode"] is False
+assert sess.auto_confirm is False
+print("   /automode e /outmode OK")
+PY
+
+echo "== 35. E2E: modo automático escolhe workflow/chat sozinho =="
+SEND_HOME=$(mktemp -d) python3 send.py "crie um app de tarefas completo" < /dev/null > /tmp/send_wf_test.log 2>&1 || true
+grep -q "ETAPA 1/4" /tmp/send_wf_test.log && echo "   workflow OK"
+SEND_HOME=$(mktemp -d) python3 send.py "oi" < /dev/null > /tmp/send_chat_test.log 2>&1 || true
+grep -q "modelo simulado" /tmp/send_chat_test.log && echo "   chat OK"
 
 echo
+if grep -qE "Traceback|AssertionError|^✗ " "$_TEST_LOG"; then
+  echo "❌ A suíte registrou erros (Traceback/AssertionError) — revise acima."
+  exit 1
+fi
 echo "✅ Todos os testes passaram!"

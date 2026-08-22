@@ -1,41 +1,64 @@
 #!/usr/bin/env bash
 #
-# publicar.sh — publica o SEND v1.4.0 no GitHub automaticamente
+# publicar.sh — publica o SEND no GitHub automaticamente
 #
 # Rode isto NO SEU PC (Pop!_OS / Ubuntu), não no sandbox:
 #
-#   1) Baixe o send-v1.4.0.zip (preview "Download do SEND v1.4.0")
+#   1) Baixe o send-v1.6.0.zip (preview "Download do SEND v1.6.0")
 #   2) bash publicar.sh
+#
+# Aceita: bash publicar.sh [caminho-do-zip]   (ou uma pasta com os arquivos)
+# Se não passar nada, procura o zip em ~/Downloads e na pasta atual.
 #
 # O script:
 #   • verifica git/gh/python3 e a autenticação no GitHub
-#   • clona o repositório (ou usa a pasta ./SEND se já existir)
-#   • aplica o zip da v1.4.0 por cima
+#   • clona o repositório (sempre limpo)
+#   • aplica o pacote por cima
 #   • roda a suíte de testes
-#   • faz commit, push para o main, cria a tag v1.4.0 e o release
+#   • faz commit, push para o main, cria a tag vX.Y.Z e o release
 #
 set -euo pipefail
 
-ZIP="${1:-}"
+ARG="${1:-}"
 REPO="https://github.com/contasuportedis-png/SEND.git"
 WORK="$(mktemp -d)/SEND"
+SRC=""
 
-# Se não passaram o caminho, procura o zip nos lugares comuns
-if [[ -z "$ZIP" ]]; then
+# ---------------------------------------------------------------- origem ---
+resolve_abs() {
+  # vira um caminho absoluto sem depender do diretório atual
+  local p="$1"
+  if [[ "$p" != /* ]]; then
+    p="$(pwd)/$p"
+  fi
+  # normaliza (removendo ./ e ..) — readlink -f também resolve symlinks
+  readlink -f "$p" 2>/dev/null || echo "$p"
+}
+
+if [[ -n "$ARG" ]]; then
+  if [[ -f "$ARG" && "$ARG" == *.zip ]]; then
+    SRC="$(resolve_abs "$ARG")"
+  elif [[ -d "$ARG" && -f "$ARG/send.py" ]]; then
+    SRC="$(resolve_abs "$ARG")"
+  else
+    echo "✗ Não encontrei '$ARG' — passe um .zip ou uma pasta com send.py" >&2
+    exit 1
+  fi
+else
   shopt -s nullglob
-  cands=(
-    "${HOME}/Downloads/send-v1.4.0.zip"
-    "${HOME}/Downloads/pacote.zip"
-    "${HOME}/Downloads/send-v1.4.0"*.zip
-    ./send-v1.4.0.zip
-    ./pacote.zip
-  )
-  for c in "${cands[@]}"; do
-    if [[ -f "$c" ]]; then ZIP="$c"; break; fi
+  for c in \
+    "${HOME}/Downloads/send-"*.zip \
+    "${HOME}/Downloads/pacote.zip" \
+    ./send-*.zip \
+    ./pacote.zip; do
+    if [[ -f "$c" ]]; then SRC="$(resolve_abs "$c")"; break; fi
   done
+  if [[ -z "$SRC" && -f ./send.py && -f ./README.md ]]; then
+    SRC="$(resolve_abs .)"   # já estamos na pasta do projeto
+  fi
 fi
 
-echo "⚡ Publicador do SEND v1.4.0"
+echo "⚡ Publicador do SEND"
 echo "────────────────────────────────────────────"
 
 # 1) Pré-requisitos
@@ -46,13 +69,13 @@ for cmd in git gh python3 unzip; do
   fi
 done
 
-# 2) Zip existe?
-if [[ ! -f "$ZIP" ]]; then
-  echo "✗ Zip não encontrado em: $ZIP" >&2
-  echo "  Baixe o send-v1.4.0.zip pelo preview do Arena e rode de novo," >&2
-  echo "  ou passe o caminho: bash publicar.sh /caminho/do/send-v1.4.0.zip" >&2
+# 2) Origem existe?
+if [[ -z "$SRC" ]]; then
+  echo "✗ Não achei o pacote. Baixe o send-v1.6.0.zip e rode de novo," >&2
+  echo "  ou passe o caminho: bash publicar.sh /caminho/do/send-v1.6.0.zip" >&2
   exit 1
 fi
+echo "✅ Pacote: $SRC"
 
 # 3) Autenticação GitHub
 if ! gh auth status >/dev/null 2>&1; then
@@ -75,9 +98,13 @@ if [[ "$BRANCH" != "main" ]]; then
   git checkout --quiet main
 fi
 
-# 5) Aplica a v1.4.0
-echo "📦 Aplicando o pacote v1.4.0…"
-unzip -qo "$ZIP"
+# 5) Aplica o pacote e descobre a versão
+echo "📦 Aplicando o pacote…"
+if [[ "$SRC" == *.zip ]]; then
+  unzip -qo "$SRC"
+else
+  cp -a "$SRC"/. .
+fi
 VERSION_LINHA="$(grep -m1 '^VERSION = ' send.py || true)"
 VER="$(echo "$VERSION_LINHA" | sed 's/.*"\(.*\)".*/\1/')"
 echo "   $VERSION_LINHA"
@@ -89,8 +116,8 @@ echo "   → publicando v${VER}"
 
 # 6) Testes
 echo "🧪 Rodando a suíte de testes…"
-if ! bash tests/run_tests.sh > /tmp/send_tests.log 2>&1; then
-  echo "✗ Testes falharam — veja /tmp/send_tests.log" >&2
+if ! timeout 600 bash tests/run_tests.sh > /tmp/send_tests.log 2>&1; then
+  echo "✗ Testes falharam ou excederam 10 minutos — veja /tmp/send_tests.log" >&2
   tail -20 /tmp/send_tests.log >&2
   exit 1
 fi
@@ -103,12 +130,13 @@ if git diff --cached --quiet; then
 else
   git commit --quiet -m "v${VER}: atualização do SEND
 
-- Banner de boas-vindas com logo ASCII em gradiente
-- Markdown colorido no streaming (títulos, negrito, código, listas)
-- Painéis com bordas para status/config/skills/memoria/backups/doctor/workflow
-- Ferramentas com ícones e preview do resultado
-- Spinner de carregamento; prompt com ícone do modo (🛠 💬 📋 🔁)
-- Paleta de comandos com seleção destacada; erros em painel vermelho"
+- Subagentes: delegação de tarefas (delegate/create_subagent; revisor, pesquisador, analista)
+- MCP: conexão com servidores externos via stdio (~/.send/mcp.json, /mcp)
+- Hooks: comandos automáticos em eventos (~/.send/hooks.json)
+- Pensamento do modelo minimizável/expansível (Enter expande, /pensamento)
+- Blocos de código em moldura com a linguagem
+- Código salvo direto no computador (pergunta antes, ou --save-code)
+- Banner ASCII, painéis, markdown colorido, ícones, spinner"
   echo "✅ Commit criado"
 fi
 git push --quiet origin main
@@ -130,6 +158,9 @@ else
     --notes "## ⚡ SEND v${VER}
 
 ### ✨ Novidades
+- **Subagentes**: delega tarefas a especialistas (revisor, pesquisador, analista) e cria os seus (delegate, create_subagent, /subagentes)
+- **MCP**: conecta servidores externos e usa as ferramentas deles (~/.send/mcp.json, /mcp)
+- **Hooks**: comandos automáticos em eventos (~/.send/hooks.json)
 - Pensamento do modelo minimizável/expansível (Enter expande, /pensamento)
 - Blocos de código em moldura com a linguagem
 - Código salvo direto no computador (pergunta antes, ou --save-code)
