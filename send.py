@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -4933,22 +4933,31 @@ def _input_with_inline_autocomplete(prompt, c):
     buf = ""
     selected = 0
     prev_box_lines = 0
+    prev_prompt_lines = 1
+
+    def _prompt_lines():
+        try:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", visible_prompt)
+            total = len(clean) + len(buf)
+            return max(1, (total + width - 1) // width)
+        except Exception:
+            return 1
 
     def _redraw():
-        nonlocal prev_box_lines
-        # limpa box anterior + linha do prompt
-        if prev_box_lines:
-            sys.stdout.write(f"\x1b[{prev_box_lines + 1}A")  # sobe box+prompt
-            sys.stdout.write("\x1b[J")  # limpa abaixo
+        nonlocal prev_box_lines, prev_prompt_lines
+        # limpa box anterior + linhas do prompt anterior (sem apagar conversa acima)
+        if prev_box_lines or prev_prompt_lines > 1:
+            move_up = prev_box_lines + prev_prompt_lines
+            sys.stdout.write(f"\x1b[{move_up}A")
+            sys.stdout.write("\x1b[J")
         else:
-            sys.stdout.write("\r\x1b[2K")  # só limpa linha atual
+            sys.stdout.write("\r\x1b[2K")
         # desenha box se buf começa com /
         box = []
         if buf.startswith("/"):
-            q = buf.split()[0]  # só o token do comando
+            q = buf.split()[0]
             matches = _inline_matches(q)
             if matches:
-                # ajusta selected dentro do range
                 nonlocal_selected = max(0, min(selected, len(matches) - 1))
                 box = _draw_inline_box(matches, nonlocal_selected, width)
         # escreve box + prompt + buffer
@@ -4958,7 +4967,7 @@ def _input_with_inline_autocomplete(prompt, c):
         else:
             prev_box_lines = 0
         sys.stdout.write(visible_prompt + buf)
-        # posiciona cursor no fim do buffer (simples)
+        prev_prompt_lines = _prompt_lines()
         sys.stdout.flush()
 
     sys.stdout.write(visible_prompt)
@@ -4995,9 +5004,9 @@ def _input_with_inline_autocomplete(prompt, c):
                             buf = matches[selected][0] + (buf[len(token):] if len(buf) > len(token) else "")
                             _redraw()
                             continue
-                # limpa box antes de sair
+                # limpa box antes de sair (sem apagar acima)
                 if prev_box_lines:
-                    sys.stdout.write(f"\x1b[{prev_box_lines + 1}A\x1b[J")
+                    sys.stdout.write(f"\x1b[{prev_box_lines + prev_prompt_lines}A\x1b[J")
                     sys.stdout.write(visible_prompt + buf + "\r\n")
                     sys.stdout.flush()
                 else:
@@ -5079,10 +5088,10 @@ def _input_with_inline_autocomplete(prompt, c):
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
             pass
-        # garante limpeza do box ao sair
+        # garante limpeza do box ao sair (sem apagar conversa acima)
         if prev_box_lines:
             try:
-                sys.stdout.write(f"\x1b[{prev_box_lines + 1}A\x1b[J")
+                sys.stdout.write(f"\x1b[{prev_box_lines + prev_prompt_lines}A\x1b[J")
                 sys.stdout.write(visible_prompt + buf)
                 sys.stdout.flush()
             except Exception:
