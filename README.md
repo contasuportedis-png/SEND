@@ -128,11 +128,17 @@ send --save-code "crie um script que ordene uma lista"   # salva sozinho
 ## 🔌 Providers de IA e configuração inicial
 
 Na primeira execução interativa, o SEND pergunta qual provider você deseja usar.
-Há presets para **OpenAI, Claude (Anthropic), NVIDIA NIM, OpenRouter, Groq e
-Mistral**, além de qualquer provider **customizado compatível com a API da
-OpenAI**. A chave pode ser informada no assistente ou pelas variáveis
-`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`,
-`OPENROUTER_API_KEY`, `GROQ_API_KEY` e `MISTRAL_API_KEY`.
+A lista inclui **Ollama, LM Studio, Claude (Anthropic), OpenAI, NVIDIA NIM,
+Google Gemini, Mistral AI, Groq, Cohere, Together AI, Perplexity, DeepSeek,
+xAI (Grok), OpenRouter, Azure OpenAI, AWS Bedrock e Hugging Face Inference**.
+Também é possível cadastrar qualquer provider customizado, informando nome,
+endpoint, API key e paths próprios. Os formatos OpenAI-compatible e Anthropic
+Messages são suportados; endpoints OpenAI-compatible funcionam sem adaptação.
+
+A chave pode ser informada no assistente ou pela variável de ambiente indicada
+pelo serviço, como `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+`NVIDIA_API_KEY`, `COHERE_API_KEY`, `TOGETHER_API_KEY`, `XAI_API_KEY` ou
+`HF_TOKEN`. Variáveis de ambiente não são copiadas para o `config.json`.
 
 Dois comandos ficam disponíveis durante toda a sessão, com ou sem `/`:
 
@@ -143,6 +149,13 @@ provider add             # cria um provider customizado
 model                    # lista modelos do provider atual e permite escolher
 model gpt-5              # troca diretamente pelo ID
 ```
+
+### Paleta e autocomplete de comandos
+
+Digite `/` para abrir a paleta. Continue digitando para filtrar (`/p` sugere
+`/provider`; `/m` sugere `/model`), navegue com **↑/↓** e complete a seleção
+com **Tab** ou **Enter**. O Tab do prompt também completa nomes de comandos.
+`/help` exibe a lista completa com uma descrição breve de cada comando.
 
 ## 🔄 Backend automático: LM Studio **ou** Ollama
 
