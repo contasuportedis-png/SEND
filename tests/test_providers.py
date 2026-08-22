@@ -28,12 +28,12 @@ class ProviderTests(unittest.TestCase):
         cfg = send.load_config()
         send.activate_provider(cfg, "openai")
         cfg["model"] = "gpt-test"
-        cfg.setdefault("providers", {}).setdefault("openai", {})["model"] = "gpt-test"
         send.activate_provider(cfg, "claude")
         self.assertIsNone(cfg["model"])
         send.activate_provider(cfg, "openai")
         self.assertEqual(cfg["model"], "gpt-test")
         self.assertEqual(cfg["base_url"], "https://api.openai.com")
+        self.assertEqual(cfg["providers"]["openai"]["model"], "gpt-test")
 
     def test_provider_environment_key_is_not_persisted(self):
         cfg = send.load_config()
@@ -83,6 +83,30 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(converted["system"], "Ajude.")
         self.assertEqual(converted["tools"][0]["name"], "read_file")
         self.assertEqual(converted["messages"][0]["role"], "user")
+
+    def test_anthropic_consecutive_tool_results_are_merged(self):
+        payload = {
+            "model": "claude-test", "temperature": 0.2,
+            "messages": [
+                {"role": "user", "content": "leia dois arquivos"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "c1", "function": {"name": "read_file",
+                                              "arguments": "{\"path\":\"a\"}"}},
+                    {"id": "c2", "function": {"name": "read_file",
+                                              "arguments": "{\"path\":\"b\"}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "aaa"},
+                {"role": "tool", "tool_call_id": "c2", "content": "bbb"},
+            ],
+        }
+        converted = send._anthropic_payload(payload)
+        users = [m for m in converted["messages"] if m["role"] == "user"]
+        self.assertEqual(len(users), 2)
+        results = users[-1]["content"]
+        self.assertEqual([b["type"] for b in results],
+                         ["tool_result", "tool_result"])
+        self.assertEqual([b["tool_use_id"] for b in results], ["c1", "c2"])
+        self.assertEqual([b["content"] for b in results], ["aaa", "bbb"])
 
     def test_anthropic_stream_conversion(self):
         events = [

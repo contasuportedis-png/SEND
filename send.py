@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -1401,8 +1401,10 @@ def activate_provider(cfg, provider_id, remember_current=True):
         raise KeyError(provider_id)
     providers = cfg.setdefault("providers", {})
     old_id = cfg.get("provider", "auto")
-    if remember_current and old_id in providers:
-        providers[old_id]["model"] = cfg.get("model")
+    # Sempre grava o modelo do provider que está saindo — mesmo se ele ainda
+    # não tiver uma entrada em providers{} (caso típico após o 1º activate).
+    if remember_current and old_id:
+        providers.setdefault(old_id, {})["model"] = cfg.get("model")
     spec = provider_spec(cfg, provider_id)
     cfg["provider"] = provider_id
     cfg["base_url"] = spec["base_url"].rstrip("/")
@@ -2969,11 +2971,20 @@ def _anthropic_payload(payload):
                                "name": fn.get("name"), "input": args})
             converted["messages"].append({"role": "assistant", "content": blocks})
         elif role == "tool":
-            converted["messages"].append({
-                "role": "user", "content": [{"type": "tool_result",
-                "tool_use_id": msg.get("tool_call_id"),
-                "content": str(msg.get("content") or "")}],
-            })
+            # A API Messages exige todos os tool_result consecutivos numa
+            # única mensagem user — um bloco por chamada.
+            block = {"type": "tool_result",
+                     "tool_use_id": msg.get("tool_call_id"),
+                     "content": str(msg.get("content") or "")}
+            prev = converted["messages"][-1] if converted["messages"] else None
+            if (prev and prev.get("role") == "user"
+                    and isinstance(prev.get("content"), list)
+                    and prev["content"]
+                    and isinstance(prev["content"][0], dict)
+                    and prev["content"][0].get("type") == "tool_result"):
+                prev["content"].append(block)
+            else:
+                converted["messages"].append({"role": "user", "content": [block]})
         elif role in ("user", "assistant"):
             converted["messages"].append(
                 {"role": role, "content": msg.get("content") or ""}
@@ -4943,7 +4954,7 @@ def main(argv=None):
         try:
             models = list_provider_models(cfg)
             if not models:
-                print(c.yellow("⚠ Nenhum modelo carregado no LM Studio."))
+                print(c.yellow(f"⚠ Nenhum modelo informado por {provider_spec(cfg)['name']}."))
                 return 1
             print(f"Modelos disponíveis em {cfg['base_url']} ({len(models)}):")
             for m in models:
@@ -4951,7 +4962,7 @@ def main(argv=None):
                 print(f"  • {m}{mark}")
             return 0
         except urllib.error.URLError as e:
-            print(c.red(f"✗ Não consegui conectar ao LM Studio em "
+            print(c.red(f"✗ Não consegui conectar a {provider_spec(cfg)['name']} em "
                         f"{cfg['base_url']} ({e.reason})."))
             print(c.yellow("  Rode 'send --doctor' para ver como resolver."))
             return 2
