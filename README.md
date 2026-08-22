@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.3.0 — assistente de IA no terminal (LM Studio)
+⚡ SEND v1.6.0 — assistente de IA no terminal (LM Studio)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -75,6 +75,55 @@ pedir). Abra um **novo terminal** e use `send --doctor` e depois `send`.
 > Pré-requisito (os dois sistemas): **Python 3** instalado e o **LM Studio**
 > com o servidor local ligado (ou o **Ollama** rodando — o SEND detecta
 > automaticamente os dois).
+
+## 🎨 Interface
+
+O SEND é todo desenhado para o terminal:
+
+- **Banner de boas-vindas** com o logo em arte ASCII com gradiente de cores
+- **Respostas formatadas**: títulos em destaque, `negrito`, `código` colorido,
+  listas com marcadores e blocos de código destacados (markdown colorido)
+- **Blocos de código em moldura** com o nome da linguagem: `┌─ python ────┐`
+- **Painéis com bordas** para status, configuração, memória, backups,
+  diagnóstico e as 4 etapas do workflow
+- **Ferramentas com ícones** (📄 ler, ✏️ editar, 🌐 internet, 🌿 git, 🧠 memória…)
+- **Spinner de carregamento** enquanto o modelo pensa
+- **Separadores** entre as respostas + estatísticas (⏱ tempo · tokens)
+- Prompt com **ícone do modo** (🛠 coding · 💬 chat · 📋 plan · 🔁 workflow)
+
+> Tudo respeita `NO_COLOR` e cai para texto puro fora de terminal interativo.
+
+## 🧠 Pensamento do modelo (minimizar / expandir)
+
+Quando o modelo raciocina (ex.: DeepSeek R1, Qwen3 com `--thinking`), o SEND
+mostra um indicador discreto enquanto pensa e, ao terminar, uma linha
+**minimizada**:
+
+```
+🧠 Pensamento do modelo (3 linhas) — [Enter] expandir · [q] pular
+```
+
+- **Enter** (ou espaço/e) → expande o pensamento completo num painel roxo
+- **q** → deixa minimizado
+- A qualquer momento, **`/pensamento`** mostra o último pensamento expandido
+
+## 💾 Código salvo direto no computador
+
+Quando o modelo escreve código, o SEND pergunta se quer **salvar no disco**:
+
+```
+💾 Bloco de código (python) — salvar como 'app.py'? (s/N/caminho)
+```
+
+- **s** → salva com o nome sugerido (usa o nome da cerca ```python app.py```,
+  senão um padrão por linguagem: `main.py`, `script.js`, `index.html`…)
+- **digite um caminho** → salva onde você quiser
+- Com **`-y`** ou **`--save-code`** → salva tudo automaticamente, sem perguntar
+- Nomes repetidos viram `app_2.py`, `app_3.py`…
+
+```bash
+send --save-code "crie um script que ordene uma lista"   # salva sozinho
+```
 
 ## 🔄 Backend automático: LM Studio **ou** Ollama
 
@@ -210,9 +259,102 @@ Descrição: formata código com 4 espaços
 Sempre use 4 espaços de indentação e remova linhas em branco extras.
 ```
 
+## 🤝 Subagentes — delegação de tarefas especializadas
+
+O SEND tem **subagentes**: agentes menores com papel, instruções e
+ferramentas próprias que recebem tarefas delegadas e devolvem o resultado.
+
+Vêm 3 prontos (criados na primeira execução em `~/.send/subagents/`):
+
+| Subagente | O que faz | Ferramentas |
+|---|---|---|
+| **revisor** | revisa código procurando bugs, falhas de segurança e melhorias | `read_file`, `list_files`, `find_files` |
+| **pesquisador** | pesquisa na internet e reúne informações com fontes | `web_search`, `fetch_url` |
+| **analista** | separa problemas complexos em partes e propõe soluções | `read_file`, `list_files`, `find_files` |
+
+O agente principal **delega sozinho** quando a tarefa é extensa ou
+repetitiva (ferramenta `delegate`), ou você delega na mão:
+
+```
+/subagentes                      # lista os subagentes
+/subagentes revisor revise este código   # roda um subagente direto
+"crie um subagente que revisa meu código"  # cria um novo (ferramenta create_subagent)
+```
+
+Cada subagente é um arquivo `.md` editável — dê novas instruções, troque as
+ferramentas (`Ferramentas: read_file, list_files`), ou use `nenhuma` para
+subagentes só de conversa e `todas` para liberar as mesmas do principal:
+
+```markdown
+# Subagente: revisor
+Descrição: revisa código procurando bugs e melhorias
+Ferramentas: read_file, list_files, find_files
+## Instruções
+Você é um revisor experiente. Leia os arquivos, liste problemas numerados…
+```
+
+> 🔒 Por padrão os subagentes usam **ferramentas seguras** (leitura, busca,
+> internet) e nunca perguntam antes de usá-las — só dê `run_command` a um
+> subagente se você confia nele.
+
+## 🔌 MCP — ferramentas de servidores externos
+
+O SEND fala o **Model Context Protocol** (MCP) via stdio: você conecta
+servidores externos e as ferramentas deles viram ferramentas do SEND
+automaticamente (`mcp_<servidor>_<ferramenta>`).
+
+Configure em `~/.send/mcp.json`:
+
+```json
+{
+  "servers": {
+    "arquivos": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"]
+    },
+    "busca": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    }
+  }
+}
+```
+
+Comandos:
+
+```
+/mcp               # mostra os servidores conectados e quantas ferramentas
+/mcp reload        # reconecta depois de editar o mcp.json
+/mcp arquivos      # lista as ferramentas de um servidor
+/config mcp_enabled false   # desliga o MCP sem apagar a config
+```
+
+> Requisito: o servidor MCP precisa estar instalado na máquina (ex.:
+> `npm install -g @modelcontextprotocol/server-filesystem`). O SEND usa o
+> transporte **stdio** (JSON-RPC 2.0) — servidores que só falam HTTP
+> streamable ainda não são suportados. No Windows, use `npx.cmd` em
+> `command` se `npx` não for encontrado.
+
+## 🪝 Hooks — comandos automáticos em eventos
+
+O SEND pode rodar comandos do seu sistema em eventos da sessão
+(`~/.send/hooks.json`):
+
+```json
+{
+  "SessionStart": ["notify-send 'SEND iniciou'"],
+  "PreToolUse": ["echo \"$SEND_TOOL $SEND_ARGS\" >> ~/.send/hooks.log"],
+  "PostToolUse": ["echo \"$SEND_RESULT\" >> ~/.send/hooks.log"],
+  "SessionEnd": ["notify-send 'SEND encerrou'"]
+}
+```
+
+Variáveis disponíveis: `SEND_EVENT`, `SEND_TOOL`, `SEND_ARGS`,
+`SEND_RESULT`, `SEND_PROMPT`. Desligue com `/config hooks false`.
+
 ## 🧰 Skills — o que o SEND sabe fazer
 
-O SEND tem **7 skills** que podem ser ligadas e desligadas individualmente
+O SEND tem **8 skills** que podem ser ligadas e desligadas individualmente
 com `/skills`:
 
 | Skill | O que faz | Ferramentas |
@@ -224,6 +366,7 @@ com `/skills`:
 | **git** | Opera repositórios git | `git_status`, `git_log`, `git_diff`, `git_commit` |
 | **processos** | Lista e encerra processos do sistema | `list_processes`, `kill_process` |
 | **memoria** | Aprende com o tempo e cria novas skills | `read_memory`, `remember`, `create_skill` |
+| **subagentes** | Delega tarefas a subagentes especializados e cria novos | `delegate`, `create_subagent` |
 
 ```bash
 /skills                      # lista as skills ativas (nativas + criadas)
@@ -287,6 +430,7 @@ send "pesquise na internet sobre LM Studio"     # skill internet
 send "mostre as informações do meu PC"          # skill pc
 send "procure o arquivo config.py"              # skill arquivos
 send "crie uma skill para revisar meu código"   # cria skill personalizada
+send "delegue a revisão do código ao subagente revisor"   # delega a um subagente
 send --models                           # lista os modelos do LM Studio
 send --doctor                           # diagnostica a instalação
 send --update                           # atualiza para a versão mais recente
@@ -300,11 +444,12 @@ Digite **`/`** e dê Enter: abre uma **paleta de comandos interativa**
 Também funciona o **Tab** para autocompletar comandos.
 
 ```
-/help     /skills [nome] [on|off]   /memoria   /resumo   /clear   /exit
+/help     /skills [nome] [on|off]   /memoria   /resumo   /pensamento   /clear   /exit
 /model [nome]   /models   /thinking on|off   /backend [lmstudio|ollama|url]
 /code     /chat   /plan   /workflow   /tools on|off
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
-/backups [restore n]   /contexto [on|off]   /update   /doctor
+/backups [restore n]   /contexto [on|off]   /subagentes [nome] [tarefa]
+/mcp [nome|reload]   /hooks   /update   /doctor
 ```
 
 ---

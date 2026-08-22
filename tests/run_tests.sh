@@ -213,5 +213,153 @@ assert send.detect_backend(cfg, send.make_colors()) == send.DEFAULT_BASE_URL
 print("   config + backend OK")
 PY
 
+echo "== 25. Blocos de código: detecção + auto-salvar =="
+python3 - <<'PY' && echo "OK"
+import os, sys, tempfile
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+content = ("Veja:\n\n```python app.py\nprint('ola')\n```\n\n"
+           "```js\nconsole.log('hi')\n```\n")
+blocks = send.parse_code_blocks(content)
+assert len(blocks) == 2 and blocks[0]["lang"] == "python"
+assert blocks[0]["meta"] == "app.py"
+used = []
+assert send.suggest_filename("python", "app.py", used) == "app.py"
+used.append("app.py")
+assert send.suggest_filename("python", "app.py", used) == "app_2.py"
+assert send.suggest_filename("js", "", []) == "script.js"
+td = tempfile.mkdtemp()
+saved = send.offer_save_code(content, c, send.load_config(), True, dest_dir=td)
+assert len(saved) == 2
+assert open(os.path.join(td, "app.py")).read().strip() == "print('ola')"
+assert open(os.path.join(td, "script.js")).read().strip() == "console.log('hi')"
+assert send.offer_save_code("sem codigo", c, {}, True, dest_dir=td) == []
+print("   detecção + auto-salvar OK")
+PY
+
+echo "== 26. Painel de pensamento (fora de TTY) =="
+python3 - <<'PY' && echo "OK"
+import sys
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+cfg = send.load_config()
+class S: pass
+sess = S()
+sess.last_reasoning = "linha 1\nlinha 2"
+send.show_thinking_panel(sess, c, cfg)  # não pode travar nem falhar fora de TTY
+print("   painel de pensamento OK")
+PY
+
+echo "== 27. Subagentes: padrão + criar + delegar =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+send.ensure_default_subagents()
+sas = send.load_subagents()
+assert [s["name"] for s in sas] == ["analista", "pesquisador", "revisor"]
+assert "não existe" in send.tool_delegate({"nome": "xpto", "tarefa": "t"}, c)
+r = send.tool_create_subagent({"nome": "tradutor", "descricao": "traduz texto",
+                               "instrucoes": "Traduza para ingles.",
+                               "ferramentas": "nenhuma"}, c)
+assert "criado" in r
+tr = next(s for s in send.load_subagents() if s["name"] == "tradutor")
+assert tr["tools"] == []
+tools = send.get_tools(send.load_config())
+names = [t["function"]["name"] for t in tools]
+assert "delegate" in names and "create_subagent" in names
+print("   subagentes OK")
+PY
+
+echo "== 28. MCP: sem servidor não quebra + nome de ferramenta =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys
+sys.path.insert(0, ".")
+import send
+c = send.make_colors()
+send.mcp_start_all(c)
+assert send.mcp_tools() == []
+assert send.tool_mcp_call("mcp_x_y", {}, c) == "Ferramenta MCP não encontrada: mcp_x_y"
+assert send._mcp_tool_name("git server", "list files") == "mcp_git_server_list_files"
+print("   mcp sem servidor OK")
+PY
+
+echo "== 29. MCP: conexão real com servidor simulado (stdio) =="
+cat > /tmp/fake_mcp_server.py <<'PY'
+import json, sys
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try: msg = json.loads(line)
+    except Exception: continue
+    mid = msg.get("id"); method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake", "version": "1.0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": "echo", "description": "Repete o texto",
+             "inputSchema": {"type": "object",
+                             "properties": {"texto": {"type": "string"}},
+                             "required": ["texto"]}}]}})
+    elif method == "tools/call":
+        args = (msg.get("params") or {}).get("arguments") or {}
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": "eco: " + str(args.get("texto", ""))}]}})
+PY
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, json, sys
+sys.path.insert(0, ".")
+import send
+home = os.environ["SEND_HOME"]
+with open(os.path.join(home, "mcp.json"), "w") as f:
+    json.dump({"servers": {"fake": {"command": "python3",
+                                    "args": ["/tmp/fake_mcp_server.py"]}}}, f)
+c = send.make_colors()
+send.mcp_start_all(c)
+names = [t["function"]["name"] for t in send.mcp_tools()]
+assert names == ["mcp_fake_echo"], names
+assert send.tool_mcp_call("mcp_fake_echo", {"texto": "oi"}, c) == "eco: oi"
+print("   mcp stdio OK")
+PY
+
+echo "== 30. Hooks: PreToolUse/PostToolUse + SessionStart/End =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, json, sys
+sys.path.insert(0, ".")
+import send
+home = os.environ["SEND_HOME"]
+log = os.path.join(home, "hooks.log")
+with open(os.path.join(home, "hooks.json"), "w") as f:
+    json.dump({"PreToolUse": [f"echo tool=$SEND_TOOL args=$SEND_ARGS >> {log}"],
+               "PostToolUse": [f"echo result=$SEND_RESULT >> {log}"],
+               "SessionStart": [f"echo inicio >> {log}"],
+               "SessionEnd": [f"echo fim >> {log}"]}, f)
+c = send.make_colors()
+cfg = send.load_config()
+send.run_hooks("SessionStart", c, cfg)
+send.execute_tool("read_file", {"path": "x"}, c, True, cfg)
+send.run_hooks("SessionEnd", c, cfg)
+lines = open(log).read().strip().splitlines()
+assert lines[0] == "inicio"
+assert lines[1] == 'tool=read_file args={"path": "x"}'
+assert lines[2].startswith("result=")
+assert lines[3] == "fim"
+cfg["hooks"] = False
+send.run_hooks("SessionStart", c, cfg)
+assert len(open(log).read().strip().splitlines()) == 4
+print("   hooks OK")
+PY
+
+echo "== 31. Delegação E2E via mock (subagente roda e devolve) =="
+SEND_HOME=$(mktemp -d) python3 send.py "delegue a revisao do codigo" 2>&1 | grep -q "🤖 subagente revisor" && echo "OK"
+
 echo
 echo "✅ Todos os testes passaram!"

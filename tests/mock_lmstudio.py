@@ -39,6 +39,11 @@ TOOL_PLAN = {
                        '{"name": "formatar", "description": "formata codigo", '
                        '"instructions": "Formate o codigo com 4 espacos."}'),
     "leia a memoria": ("call_mem", "read_memory", "{}"),
+    "delegue": ("call_delegate", "delegate",
+                '{"nome": "revisor", "tarefa": "revise o codigo"}'),
+    "crie um subagente": ("call_csub", "create_subagent",
+                          '{"nome": "tradutor", "descricao": "traduz texto", '
+                          '"instrucoes": "Traduza para ingles."}'),
 }
 
 

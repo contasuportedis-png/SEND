@@ -21,12 +21,14 @@ Uso:
 """
 
 import argparse
+import atexit
 import difflib
 import fnmatch
 import html.parser
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
@@ -50,7 +52,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.3.0"
+VERSION = "1.6.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 DEFAULT_UPDATE_URL = (
     "https://github.com/contasuportedis-png/SEND/releases/latest/download/send.py"
@@ -104,6 +106,379 @@ def make_colors():
 
 
 # ---------------------------------------------------------------------------
+# Estética — banner, painéis, gradiente, spinner e markdown colorido
+# ---------------------------------------------------------------------------
+
+import threading
+
+
+def _rgb(r, g, b):
+    return f"\033[38;2;{r};{g};{b}m"
+
+
+def gradient(text, c, start=(45, 212, 255), end=(255, 90, 255)):
+    """Texto com gradiente de cor (do ciano ao magenta)."""
+    if not c.enabled or len(text) <= 1:
+        return text
+    n = len(text)
+    out = []
+    for i, ch in enumerate(text):
+        t = i / max(1, n - 1)
+        r = int(start[0] + (end[0] - start[0]) * t)
+        g = int(start[1] + (end[1] - start[1]) * t)
+        b = int(start[2] + (end[2] - start[2]) * t)
+        out.append(_rgb(r, g, b) + ch)
+    return "".join(out) + "\033[0m"
+
+
+SEND_ART = [
+    "███████╗███████╗███╗   ██╗██████╗ ",
+    "██╔════╝██╔════╝████╗  ██║██╔══██╗",
+    "███████╗█████╗  ██╔██╗ ██║██║  ██║",
+    "╚════██║██╔══╝  ██║╚██╗██║██║  ██║",
+    "███████║███████╗██║ ╚████║██████╔╝",
+    "╚══════╝╚══════╝╚═╝  ╚═══╝╚═════╝ ",
+]
+
+
+def banner(c, model=None, mode=None):
+    """Banner de boas-vindas com arte ASCII em gradiente."""
+    if c.enabled:
+        for i, line in enumerate(SEND_ART):
+            t = i / max(1, len(SEND_ART) - 1)
+            r = int(45 + (255 - 45) * t)
+            g = int(212 + (90 - 212) * t)
+            b = int(255 + (255 - 255) * t)
+            print(_rgb(r, g, b) + line + "\033[0m")
+    else:
+        print(SEND_ART[0])
+    info = f"v{VERSION}"
+    if model:
+        info += f"  ·  modelo: {model}"
+    if mode:
+        info += f"  ·  modo: {mode}"
+    print(c.dim("  " + info))
+    print(c.dim("  digite / para a paleta de comandos · /help · Ctrl+C para sair"))
+    print()
+
+
+def panel(title, body, c, color="cyan", width=66):
+    """Painel com borda e título (ex.: ╭─ 📋 ETAPA 1/4 ───────╮)."""
+    border = getattr(c, color)
+    title_s = f" {title} "
+    w = max(width, len(title) + 8)
+    pad = w - len(title_s) - 2
+    top = border("╭─") + c.bold(title_s) + border("─" * max(0, pad) + "╮")
+    lines = str(body).split("\n")
+    out = [top]
+    for ln in lines:
+        ln = ln[: w - 4]
+        out.append(border("│ ") + ln + " " * max(0, w - 4 - len(ln)) + border(" │"))
+    out.append(border("╰" + "─" * (w - 2) + "╯"))
+    print("\n".join(out))
+
+
+def hr(c, ch="─", n=56, color="dim"):
+    """Linha divisória."""
+    fn = getattr(c, color)
+    print(fn(ch * n))
+
+
+def small(title, body, c, color="cyan"):
+    """Linha de status compacta:  ● título — texto"""
+    border = getattr(c, color)
+    print(border(" ● ") + c.bold(title) + c.dim(" — " + str(body)))
+
+
+class Spinner:
+    """Animação de carregamento (só em terminal interativo)."""
+
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, c, msg="processando…"):
+        self.c = c
+        self.msg = msg
+        self._stop = False
+        self._t = None
+
+    def __enter__(self):
+        if not self.c.enabled:
+            return self
+        sys.stdout.write(" ")
+        sys.stdout.flush()
+        self._stop = False
+
+        def run():
+            i = 0
+            while not self._stop:
+                f = self.FRAMES[i % len(self.FRAMES)]
+                sys.stdout.write("\r" + self.c.cyan(f) + " " + self.msg)
+                sys.stdout.flush()
+                i += 1
+                time.sleep(0.08)
+
+        self._t = threading.Thread(target=run, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *a):
+        self._stop = True
+        if self._t:
+            self._t.join(timeout=0.3)
+        if self.c.enabled:
+            sys.stdout.write("\r" + " " * (len(self.msg) + 4) + "\r")
+            sys.stdout.flush()
+
+
+def _inline_md(text, c):
+    """Aplica cores a **negrito** e `código` em uma linha de texto."""
+    text = re.sub(r"\*\*(.+?)\*\*", lambda m: c.bold(m.group(1)), text)
+    text = re.sub(r"`([^`]+)`", lambda m: c.yellow(m.group(1)), text)
+    text = re.sub(r"^#{1,6}\s*(.+)$", lambda m: c.bold(c.cyan(m.group(1))), text)
+    return text
+
+
+class MarkdownPrinter:
+    """Imprime o streaming do modelo com cores: títulos, negrito, código,
+    listas. Em terminal sem cor, escreve o texto puro."""
+
+    def __init__(self, c, out=None):
+        self.c = c
+        self.out = out or sys.stdout
+        self.line_buf = ""
+        self.in_code = False
+
+    def write(self, piece):
+        self.line_buf += piece
+        while "\n" in self.line_buf:
+            line, self.line_buf = self.line_buf.split("\n", 1)
+            self._emit(line)
+
+    def finish(self):
+        if self.line_buf:
+            self._emit(self.line_buf)
+        if not self.line_buf.endswith("\n"):
+            self.out.write("\n")
+
+    def _emit(self, line):
+        if not self.c.enabled:
+            self.out.write(line + "\n")
+            return
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if self.in_code:
+                self.in_code = False
+                self.out.write(self.c.dim("└" + "─" * 42) + "\n")
+            else:
+                lang = re.match(r"```([\w+\-]*)", stripped)
+                lang = (lang.group(1) if lang and lang.group(1) else "código")
+                self.out.write(self.c.dim(f"┌─ {lang} " + "─" * max(2, 38 - len(lang))) + "\n")
+                self.in_code = True
+            return
+        if self.in_code:
+            self.out.write(self.c.green(line) + "\n")
+            return
+        if line.startswith("#"):
+            self.out.write(self.c.bold(self.c.cyan(line)) + "\n")
+            return
+        if stripped.startswith(("- ", "* ", "+ ", "• ")):
+            self.out.write(self.c.cyan("  • ") + _inline_md(line[2:], self.c) + "\n")
+            return
+        if re.match(r"^\s*\d+[\.\)]", line):
+            num = re.match(r"^\s*\d+", line).group(0)
+            rest = re.sub(r"^\s*\d+[\.\)]\s*", " ", line, count=1)
+            self.out.write(self.c.magenta("  " + num + ".") +
+                           _inline_md(rest, self.c) + "\n")
+            return
+        self.out.write(_inline_md(line, self.c) + "\n")
+
+
+TOOL_ICONS = {
+    "read_file": "📄", "write_file": "📝", "edit_file": "✏️ ", "list_files": "📂",
+    "find_files": "🔍", "run_command": "💻", "web_search": "🌐", "fetch_url": "🌐",
+    "system_info": "🖥️", "open_file": "📂", "open_url": "🔗",
+    "git_status": "🌿", "git_log": "🌿", "git_diff": "🌿", "git_commit": "🌿",
+    "list_processes": "⚙️", "kill_process": "🛑", "read_memory": "🧠",
+    "remember": "🧠", "create_skill": "⭐",
+}
+
+
+def tool_icon(name):
+    if name.startswith("skill_"):
+        return "⭐"
+    return TOOL_ICONS.get(name, "🔧")
+
+
+def nice_error(c, title, msg):
+    """Erro em painel vermelho."""
+    panel("✗ " + title, msg, c, color="red", width=66)
+
+
+def _wait_key(timeout=4.0):
+    """Aguarda uma tecla (sem precisar de Enter). Retorna '' no timeout."""
+    import select
+    import termios
+    import tty
+    if not sys.stdin.isatty() or os.name == "nt":
+        return ""
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            return sys.stdin.read(1)
+        return ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except Exception:
+            pass
+
+
+def show_thinking_panel(sess, c, cfg):
+    """Mostra o pensamento do modelo em modo minimizado/expansível.
+
+    Depois da resposta, imprime uma linha discreta:
+        🧠 Pensamento do modelo (12 linhas) — [Enter] expandir · [q] pular
+    Enter/espaço/e expande o painel; q (ou 4s de espera) minimiza.
+    Fora de terminal interativo, apenas informa o comando /pensamento.
+    """
+    text = (getattr(sess, "last_reasoning", "") or "").strip()
+    if not text or not cfg.get("show_reasoning", True):
+        return
+    n = len([ln for ln in text.splitlines() if ln.strip()])
+    if not sys.stdin.isatty():
+        print(c.dim(f"🧠 Pensamento do modelo ({n} linhas) — "
+                    "use /pensamento para expandir"))
+        return
+    sys.stdout.write(c.dim(f"🧠 Pensamento do modelo ({n} linhas) — "
+                           "[Enter] expandir · [q] pular "))
+    sys.stdout.flush()
+    key = _wait_key(4.0)
+    sys.stdout.write("\r" + " " * 70 + "\r")
+    sys.stdout.flush()
+    if key in ("\r", "\n", " ", "e", "E"):
+        panel("🧠 PENSAMENTO DO MODELO", text, c, color="magenta", width=78)
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Código: detecção de blocos e auto-salvar no computador
+# ---------------------------------------------------------------------------
+
+CODE_LANG_FILES = {
+    "python": "main.py", "py": "main.py", "python3": "main.py",
+    "javascript": "script.js", "js": "script.js", "node": "script.js",
+    "typescript": "script.ts", "ts": "script.ts",
+    "bash": "script.sh", "sh": "script.sh", "shell": "script.sh",
+    "zsh": "script.sh", "html": "index.html", "css": "style.css",
+    "json": "dados.json", "yaml": "config.yaml", "yml": "config.yml",
+    "toml": "config.toml", "ini": "config.ini", "sql": "consulta.sql",
+    "java": "Main.java", "c": "main.c", "cpp": "main.cpp", "c++": "main.cpp",
+    "c#": "Program.cs", "cs": "Program.cs", "go": "main.go",
+    "rust": "main.rs", "ruby": "script.rb", "rb": "script.rb",
+    "php": "script.php", "swift": "main.swift", "kotlin": "Main.kt",
+    "r": "analise.R", "lua": "script.lua", "perl": "script.pl",
+    "markdown": "notas.md", "md": "notas.md", "text": "notas.txt",
+    "dockerfile": "Dockerfile", "docker": "Dockerfile",
+    "makefile": "Makefile", "make": "Makefile", "": "codigo.txt",
+}
+
+
+def _unique_name(name, used):
+    if name not in used:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    i = 2
+    while f"{stem}_{i}{dot}{ext}" in used:
+        i += 1
+    return f"{stem}_{i}{dot}{ext}"
+
+
+def suggest_filename(lang, meta, used):
+    """Sugere um nome de arquivo para um bloco de código.
+
+    Usa o nome citado na cerca do código (```python app.py), senão mapeia
+    pela linguagem.
+    """
+    m = (meta or "").strip()
+    if m and "." in m:
+        cand = m.split()[0].strip("`\"'()[]")
+        if re.match(r"^[\w.\-/]+$", cand):
+            return _unique_name(Path(cand).name, used)
+    name = CODE_LANG_FILES.get((lang or "").lower(), "codigo.txt")
+    return _unique_name(name, used)
+
+
+def parse_code_blocks(content):
+    """Extrai blocos de código cercados por ``` de uma resposta."""
+    blocks = []
+    if not content:
+        return blocks
+    for m in re.finditer(r"```([\w+\-]*)[ \t]*([^\n]*)\n(.*?)```",
+                         content, re.S):
+        lang = m.group(1).strip()
+        meta = m.group(2).strip()
+        code = m.group(3).rstrip("\n")
+        if code.strip():
+            blocks.append({"lang": lang, "meta": meta, "code": code})
+    return blocks
+
+
+def offer_save_code(content, c, cfg, auto_confirm, dest_dir=None):
+    """Salva blocos de código da resposta no computador.
+
+    - com -y / auto_save_code: salva tudo sem perguntar
+    - interativo: pergunta 'salvar como X? (s/N/caminho)'
+    - sem terminal: não pergunta, não salva
+    Retorna a lista de arquivos salvos.
+    """
+    blocks = parse_code_blocks(content)
+    if not blocks:
+        return []
+    saved = []
+    base = Path(dest_dir) if dest_dir else Path.cwd()
+    used = []
+    for b in blocks[:4]:
+        fname = suggest_filename(b["lang"], b["meta"], used)
+        used.append(fname)
+        target = base / fname
+        if auto_confirm or cfg.get("auto_save_code"):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(b["code"], encoding="utf-8")
+                saved.append(str(target))
+                print(c.green(f"  💾 Código salvo: {target}"))
+            except Exception as e:
+                print(c.red(f"  ✗ Não foi possível salvar {target}: {e}"))
+            continue
+        if not sys.stdin.isatty():
+            continue
+        try:
+            r = input(c.dim(f"💾 Bloco de código ({b['lang'] or 'texto'}) — "
+                            f"salvar como '{fname}'? (s/N/caminho) ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not r or r.lower() in ("n", "não", "nao", "no"):
+            continue
+        if r.lower() not in ("s", "sim", "y", "yes"):
+            target = Path(r).expanduser()
+            if not target.is_absolute():
+                target = Path.cwd() / target
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(b["code"], encoding="utf-8")
+            saved.append(str(target))
+            print(c.green(f"  ✅ Código salvo: {target}"))
+        except Exception as e:
+            print(c.red(f"  ✗ Não foi possível salvar {target}: {e}"))
+    return saved
+
+
+# ---------------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------------
 
@@ -118,10 +493,13 @@ DEFAULT_CONFIG = {
     "auto_confirm": False,         # -y
     "temperature": 0.7,
     "skills": ["arquivos", "terminal", "internet", "pc",
-               "git", "processos", "memoria"],
+               "git", "processos", "memoria", "subagentes"],
     "auto_backend": True,          # detecta LM Studio → Ollama automaticamente
     "project_context": True,       # injeta a árvore do projeto no contexto
     "auto_summarize": True,        # resume conversas longas automaticamente
+    "auto_save_code": False,       # True = salva blocos de código sem perguntar
+    "mcp_enabled": True,           # conecta servidores MCP de ~/.send/mcp.json
+    "hooks": True,                 # executa hooks de ~/.send/hooks.json
 }
 
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -143,14 +521,19 @@ SKILLS = {
     "processos": "listar e encerrar processos do sistema",
     "memoria": "aprender com o tempo: lembrar informações, ver a memória "
                "de longo prazo e criar novas skills para o futuro",
+    "subagentes": "delegar tarefas a subagentes especializados (revisor, "
+                  "pesquisador, analista…) e criar novos subagentes",
 }
 
 SKILL_ORDER = ["arquivos", "terminal", "internet", "pc",
-               "git", "processos", "memoria"]
+               "git", "processos", "memoria", "subagentes"]
 
 # Memória de longo prazo (aprendizado) e skills personalizadas
 MEMORY_PATH = SEND_HOME / "memoria.md"
 SKILLS_DIR = SEND_HOME / "skills"
+SUBAGENTS_DIR = SEND_HOME / "subagents"
+MCP_CONFIG_PATH = SEND_HOME / "mcp.json"
+HOOKS_PATH = SEND_HOME / "hooks.json"
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 "
               "Firefox/126.0")
@@ -173,7 +556,8 @@ MEMORY_PROMPT_HINT = (
     " Você tem uma memória de longo prazo em ~/.send/memoria.md. Sempre que "
     "aprender algo útil (preferências do usuário, decisões do projeto, bugs "
     "corrigidos, comandos importantes), registre com a ferramenta 'remember'. "
-    "Você pode criar novas skills para o futuro com a ferramenta 'create_skill'."
+    "Você pode criar novas skills para o futuro com a ferramenta 'create_skill' "
+    "e novos subagentes especializados com a ferramenta 'create_subagent'."
 )
 
 
@@ -265,7 +649,509 @@ def get_tools(cfg):
     for cs in load_custom_skills():
         if cs["name"] in enabled:
             tools.append(custom_skill_tool(cs))
+    if cfg.get("mcp_enabled", True):
+        tools.extend(mcp_tools())
     return tools
+
+
+# ---------------------------------------------------------------------------
+# MCP (Model Context Protocol) — ferramentas de servidores externos
+# ---------------------------------------------------------------------------
+# Configuração: ~/.send/mcp.json
+#   {"servers": {"nome": {"command": "npx",
+#                         "args": ["-y", "@modelcontextprotocol/server-..."],
+#                         "env": {"CHAVE": "valor"}}}}
+# Cada servidor MCP expõe ferramentas que viram mcp_<servidor>_<ferramenta>.
+
+MCP_PROTOCOL_VERSION = "2025-03-26"
+_MCP = {"started": False, "servers": {}}
+
+
+def mcp_load_config():
+    """Lê ~/.send/mcp.json e devolve {nome: {command, args, env}}."""
+    try:
+        if not MCP_CONFIG_PATH.exists():
+            return {}
+        data = json.loads(MCP_CONFIG_PATH.read_text(encoding="utf-8"))
+        servers = data.get("servers") or {}
+        out = {}
+        for name, spec in servers.items():
+            if isinstance(spec, dict) and spec.get("command"):
+                out[name] = {
+                    "command": str(spec["command"]),
+                    "args": [str(a) for a in (spec.get("args") or [])],
+                    "env": {str(k): str(v) for k, v in (spec.get("env") or {}).items()},
+                }
+        return out
+    except Exception:
+        return {}
+
+
+def _mcp_reader(proc, srv):
+    """Thread: lê stdout do processo MCP e enfileira as mensagens JSON-RPC."""
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            srv["queue"].put(msg)
+    except Exception:
+        pass
+
+
+def _mcp_err_reader(proc, srv):
+    """Thread: drena o stderr do processo (evita travar o pipe)."""
+    try:
+        data = proc.stderr.read(20000)
+        srv["stderr"] = data
+    except Exception:
+        pass
+
+
+def _mcp_send(name, msg):
+    srv = _MCP["servers"].get(name)
+    if not srv or not srv.get("proc"):
+        return False
+    try:
+        with srv["wlock"]:
+            srv["proc"].stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            srv["proc"].stdin.flush()
+        return True
+    except Exception:
+        return False
+
+
+def _mcp_wait(srv, msg_id, timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            msg = srv["queue"].get(timeout=0.2)
+        except Exception:
+            continue
+        if isinstance(msg, dict) and msg.get("id") == msg_id:
+            return msg
+        # notificações do servidor (ex.: logs) — ignora
+    return None
+
+
+def _mcp_call(name, method, params=None, timeout=10):
+    srv = _MCP["servers"].get(name)
+    if not srv or srv.get("error"):
+        return {"error": (srv.get("error") if srv else
+                          "servidor MCP não conectado")}
+    with srv["wlock"]:
+        msg_id = srv["next_id"]
+        srv["next_id"] += 1
+    msg = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    if not _mcp_send(name, msg):
+        return {"error": "falha ao enviar mensagem ao servidor MCP"}
+    resp = _mcp_wait(srv, msg_id, timeout)
+    if resp is None:
+        return {"error": f"timeout aguardando '{method}'"}
+    if resp.get("error"):
+        return {"error": json.dumps(resp["error"], ensure_ascii=False)[:300]}
+    return {"result": resp.get("result")}
+
+
+def _mcp_tool_name(server, tool):
+    clean = re.sub(r"[^a-zA-Z0-9_-]+", "_", f"{server}_{tool}").strip("_")
+    return "mcp_" + clean
+
+
+def mcp_connect(name, spec, c):
+    """Conecta a um servidor MCP via stdio (JSON-RPC 2.0, linhas newline)."""
+    srv = {"tools": [], "error": None, "next_id": 1, "stderr": ""}
+    _MCP["servers"][name] = srv
+    try:
+        env = dict(os.environ)
+        env.update(spec["env"])
+        proc = subprocess.Popen(
+            [spec["command"]] + spec["args"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace", bufsize=1, env=env,
+        )
+        srv["proc"] = proc
+        srv["queue"] = queue.Queue()
+        srv["wlock"] = threading.Lock()
+        threading.Thread(target=_mcp_reader, args=(proc, srv),
+                         daemon=True).start()
+        threading.Thread(target=_mcp_err_reader, args=(proc, srv),
+                         daemon=True).start()
+        resp = _mcp_call(name, "initialize", {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "send", "version": VERSION},
+        }, timeout=10)
+        if "error" in resp:
+            raise RuntimeError("initialize: " + resp["error"])
+        _mcp_send(name, {"jsonrpc": "2.0",
+                         "method": "notifications/initialized"})
+        resp = _mcp_call(name, "tools/list", timeout=10)
+        if "error" in resp:
+            raise RuntimeError("tools/list: " + resp["error"])
+        for t in (resp.get("result") or {}).get("tools") or []:
+            tname = str(t.get("name") or "")
+            if not tname:
+                continue
+            schema = t.get("inputSchema") or {}
+            if not isinstance(schema, dict):
+                schema = {"type": "object", "properties": {}}
+            srv["tools"].append({
+                "type": "function",
+                "function": {
+                    "name": _mcp_tool_name(name, tname),
+                    "description": (f"MCP [{name}] {tname}: "
+                                    + str(t.get("description")
+                                          or "(sem descrição)")),
+                    "parameters": schema,
+                },
+                "skill": "mcp",
+                "mcp": {"server": name, "tool": tname},
+            })
+        if c.enabled:
+            print(c.dim(f"  🔌 MCP '{name}': {len(srv['tools'])} ferramentas "
+                        f"conectadas"))
+    except Exception as e:
+        srv["error"] = str(e)
+        if srv.get("proc"):
+            try:
+                srv["proc"].terminate()
+            except Exception:
+                pass
+            srv["proc"] = None
+        if c.enabled:
+            print(c.yellow(f"  ⚠ MCP '{name}': falhou ao conectar — {e}"))
+
+
+def mcp_start_all(c):
+    """Conecta a todos os servidores configurados em ~/.send/mcp.json."""
+    _MCP["started"] = True
+    for name, spec in mcp_load_config().items():
+        mcp_connect(name, spec, c)
+
+
+def mcp_disconnect(name):
+    srv = _MCP["servers"].get(name)
+    if srv and srv.get("proc"):
+        try:
+            srv["proc"].terminate()
+        except Exception:
+            pass
+        srv["proc"] = None
+
+
+def mcp_stop_all():
+    """Encerra os processos MCP na saída do programa."""
+    if not _MCP.get("started"):
+        return
+    for name in list(_MCP["servers"]):
+        mcp_disconnect(name)
+
+
+atexit.register(mcp_stop_all)
+
+
+def mcp_tools():
+    """Ferramentas expostas pelos servidores MCP conectados."""
+    out = []
+    for srv_name, srv in _MCP["servers"].items():
+        if srv.get("error"):
+            continue
+        out.extend(srv.get("tools", []))
+    return out
+
+
+def mcp_summary(cfg):
+    """Resumo de status MCP para /status."""
+    if not cfg.get("mcp_enabled", True):
+        return "desligado"
+    if not _MCP.get("started") or not _MCP["servers"]:
+        return "nenhum servidor"
+    n_ok = sum(1 for s in _MCP["servers"].values() if not s.get("error"))
+    n_err = sum(1 for s in _MCP["servers"].values() if s.get("error"))
+    if n_err:
+        return f"{n_ok} conectado(s) · {n_err} com erro"
+    return f"{n_ok} conectado(s)"
+
+
+def _mcp_text(result):
+    out = []
+    for part in result.get("content") or []:
+        if isinstance(part, dict):
+            if part.get("type") == "text":
+                out.append(str(part.get("text", "")))
+            elif part.get("text"):
+                out.append(str(part["text"]))
+    return "\n".join(out)
+
+
+def tool_mcp_call(name, args, c, cfg=None):
+    """Executa uma ferramenta de um servidor MCP (mcp_<servidor>_<ferramenta>)."""
+    for srv_name, srv in _MCP["servers"].items():
+        for t in srv.get("tools", []):
+            if t["function"]["name"] == name:
+                resp = _mcp_call(srv_name, "tools/call",
+                                 {"name": t["mcp"]["tool"],
+                                  "arguments": args or {}},
+                                 timeout=120)
+                if "error" in resp:
+                    return f"Erro MCP: {resp['error']}"
+                result = resp.get("result") or {}
+                if result.get("isError"):
+                    return "Erro MCP: " + (_mcp_text(result) or "falha")
+                return _mcp_text(result) or "(sem saída)"
+    return f"Ferramenta MCP não encontrada: {name}"
+
+
+# ---------------------------------------------------------------------------
+# Hooks — comandos do sistema disparados em eventos (opcional)
+# ---------------------------------------------------------------------------
+# Configuração: ~/.send/hooks.json
+#   {"SessionStart": ["comando"], "PreToolUse": ["comando"],
+#    "PostToolUse": ["comando"], "SessionEnd": ["comando"]}
+# Variáveis de ambiente: SEND_EVENT, SEND_TOOL, SEND_ARGS, SEND_RESULT,
+# SEND_PROMPT. Comandos rodam via shell com timeout de 15s.
+
+def run_hooks(event, c, cfg=None, **env):
+    """Executa os hooks do evento (no-op se não houver arquivo configurado)."""
+    if cfg is not None and not cfg.get("hooks", True):
+        return
+    try:
+        if not HOOKS_PATH.exists():
+            return
+        data = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
+        cmds = data.get(event) or []
+        if not isinstance(cmds, list):
+            return
+        full_env = dict(os.environ)
+        full_env["SEND_EVENT"] = event
+        for k, v in env.items():
+            full_env["SEND_" + k.upper()] = v
+        for cmd in cmds:
+            if not isinstance(cmd, str) or not cmd.strip():
+                continue
+            try:
+                r = subprocess.run(cmd, shell=True, timeout=15, env=full_env,
+                                   capture_output=True, text=True)
+                out = (r.stdout or "").strip()
+                if out and c.enabled:
+                    for line in out.splitlines()[:5]:
+                        print(c.dim("    🪝 " + line))
+            except subprocess.TimeoutExpired:
+                if c.enabled:
+                    print(c.yellow("    🪝 hook excedeu 15s (ignorado)"))
+            except Exception as e:
+                if c.enabled:
+                    print(c.dim(f"    🪝 hook falhou: {e}"))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Subagentes — agentes especializados que recebem tarefas delegadas
+# ---------------------------------------------------------------------------
+# Cada subagente é um arquivo em ~/.send/subagents/<nome>.md:
+#   # Subagente: <nome>
+#   Descrição: <o que ele faz>
+#   Ferramentas: read_file, list_files   (opcional; 'nenhuma' = sem tools;
+#                                         'todas' = mesmas do agente principal)
+#   ## Instruções
+#   <papel e regras do subagente>
+# O agente principal delega com a ferramenta 'delegate' (ou /subagentes).
+
+# Ferramentas padrão (seguras) quando o subagente não lista as suas
+SUBAGENT_DEFAULT_TOOLS = [
+    "read_file", "list_files", "find_files",
+    "web_search", "fetch_url", "read_memory", "system_info",
+]
+
+DEFAULT_SUBAGENTS = {
+    "revisor": (
+        "# Subagente: revisor\n"
+        "Descrição: revisa código procurando bugs, falhas de segurança e "
+        "melhorias, e devolve uma lista de problemas encontrados\n"
+        "Ferramentas: read_file, list_files, find_files\n"
+        "## Instruções\n"
+        "Você é um revisor de código experiente. Leia os arquivos indicados, "
+        "procure bugs, problemas de segurança, código morto e oportunidades "
+        "de melhoria. Responda com uma lista numerada e objetiva: problema, "
+        "arquivo/linha, correção sugerida. Não edite arquivos."
+    ),
+    "pesquisador": (
+        "# Subagente: pesquisador\n"
+        "Descrição: pesquisa na internet e reúne informações com fontes para "
+        "responder perguntas técnicas\n"
+        "Ferramentas: web_search, fetch_url\n"
+        "## Instruções\n"
+        "Você é um pesquisador. Use web_search e fetch_url para buscar "
+        "informações atualizadas e confiáveis. Responda com um resumo "
+        "organizado citando as fontes consultadas. Se uma busca falhar, "
+        "tente outra consulta com termos diferentes."
+    ),
+    "analista": (
+        "# Subagente: analista\n"
+        "Descrição: analisa problemas complexos, separa em partes e propõe "
+        "soluções antes de qualquer implementação\n"
+        "Ferramentas: read_file, list_files, find_files\n"
+        "## Instruções\n"
+        "Você é um analista. Entenda o problema, divida-o em partes, liste "
+        "as opções de solução com prós e contras e recomende uma. Não "
+        "execute comandos nem edite arquivos."
+    ),
+}
+
+
+def ensure_default_subagents():
+    """Cria os subagentes de exemplo na primeira execução (não sobrescreve)."""
+    try:
+        SUBAGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        for name, text in DEFAULT_SUBAGENTS.items():
+            f = SUBAGENTS_DIR / (name + ".md")
+            if not f.exists():
+                f.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_subagents():
+    """Lê os subagentes de ~/.send/subagents/*.md."""
+    out = []
+    try:
+        if not SUBAGENTS_DIR.exists():
+            return out
+        for f in sorted(SUBAGENTS_DIR.glob("*.md")):
+            try:
+                text = f.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            name = f.stem.strip().lower()
+            if not name:
+                continue
+            m = re.search(r"(?im)^\s*descri(?:ção|cao)\s*:\s*(.+)$", text)
+            desc = m.group(1).strip() if m else "(sem descrição)"
+            mt = re.search(r"(?im)^\s*ferramentas?\s*:\s*(.+)$", text)
+            tools = None
+            if mt:
+                raw = mt.group(1).strip().lower()
+                if raw in ("nenhuma", "nenhum", "sem", "chat"):
+                    tools = []
+                else:
+                    tools = [t.strip() for t in re.split(r"[,;]", raw)
+                             if t.strip()]
+            out.append({"name": name, "description": desc, "tools": tools,
+                        "instructions": text})
+    except Exception:
+        pass
+    return out
+
+
+def subagent_system_prompt(cfg, sa):
+    """Prompt de sistema de um subagente: papel + instruções + memória."""
+    parts = [
+        BASE_SYSTEM,
+        " Você está atuando como um SUBAGENTE especializado chamado '"
+        + sa["name"] + "': " + sa["description"] + ".",
+        " Sua tarefa foi delegada pelo agente principal do SEND. "
+        "Execute-a completamente e responda apenas com o resultado final, "
+        "de forma objetiva.",
+    ]
+    mem = memory_summary()
+    if mem:
+        parts.append("\n\n## Memória de longo prazo\n" + mem)
+    parts.append("\n\n## Instruções do subagente\n" + (sa["instructions"] or ""))
+    return "".join(parts)
+
+
+def tools_by_names(names):
+    """Ferramentas (nativas + skills criadas + MCP) filtradas por nome."""
+    allt = list(TOOLS)
+    for cs in load_custom_skills():
+        allt.append(custom_skill_tool(cs))
+    allt.extend(mcp_tools())
+    allowed = set(names)
+    return [t for t in allt if t["function"]["name"] in allowed]
+
+
+def run_subagent(name, tarefa, c, cfg=None):
+    """Executa um subagente com sua própria conversa e ferramentas.
+
+    Retorna o texto final do subagente (para virar resultado de ferramenta).
+    """
+    sa = next((s for s in load_subagents() if s["name"] == name), None)
+    if not sa:
+        return (f"Subagente '{name}' não existe. Use a ferramenta "
+                f"'create_subagent' para criá-lo, ou /subagentes para listar.")
+    sub_cfg = dict(cfg or DEFAULT_CONFIG)
+    sub = Session(sub_cfg, c)
+    sub.system_override = subagent_system_prompt(sub_cfg, sa)
+    sub.messages = [{"role": "user", "content": "Tarefa: " + tarefa}]
+    if sa["tools"] is None:
+        sub.custom_tools = [t for t in TOOLS
+                            if t["function"]["name"] in SUBAGENT_DEFAULT_TOOLS]
+        tools_on = True
+    elif not sa["tools"]:
+        sub.custom_tools = []
+        tools_on = False
+    elif "todas" in sa["tools"] or "todos" in sa["tools"]:
+        sub.custom_tools = None  # mesmas ferramentas ativas do agente principal
+        tools_on = True
+    else:
+        sub.custom_tools = tools_by_names(sa["tools"])
+        tools_on = True
+    print(c.cyan("  🤖 subagente ") + c.bold(sa["name"]) + c.dim(" — "
+          + sa["description"]))
+    print(c.dim("  ─ tarefa: " + tarefa[:120] + ("…" if len(tarefa) > 120
+                                                 else "")))
+    try:
+        content = ask_model(sub, tools_on, c, True)  # sem perguntar: delegado
+    except Exception as e:
+        content = f"Erro ao executar o subagente: {e}"
+    return f"[subagente:{name}]\n{content or '(sem resposta)'}"
+
+
+def tool_delegate(args, c, cfg=None):
+    """Ferramenta 'delegate': envia uma tarefa para um subagente."""
+    name = str(args.get("nome") or args.get("name") or "").strip().lower()
+    tarefa = str(args.get("tarefa") or "").strip()
+    if not name:
+        return "Erro: informe 'nome' do subagente (ex.: revisor)."
+    if not tarefa:
+        return "Erro: informe 'tarefa' para o subagente."
+    return run_subagent(name, tarefa, c, cfg)
+
+
+def tool_create_subagent(args, c, cfg=None):
+    """Ferramenta 'create_subagent': cria um subagente para o futuro."""
+    nome = str(args.get("nome") or "").strip().lower()
+    desc = str(args.get("descricao") or "").strip()
+    instrucoes = str(args.get("instrucoes") or "").strip()
+    ferramentas = str(args.get("ferramentas") or "").strip()
+    if not nome:
+        return "Erro: informe 'nome' do subagente."
+    if not re.fullmatch(r"[a-z0-9_-]{1,40}", nome):
+        return ("Erro: nome inválido — use só letras minúsculas, números, "
+                "'-' ou '_'.")
+    if not instrucoes:
+        return "Erro: informe 'instrucoes' (o papel do subagente)."
+    try:
+        SUBAGENTS_DIR.mkdir(parents=True, exist_ok=True)
+        f = SUBAGENTS_DIR / (nome + ".md")
+        lines = ["# Subagente: " + nome,
+                 "Descrição: " + (desc or nome),
+                 "Ferramentas: " + ferramentas,
+                 "## Instruções", instrucoes]
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return (f"✅ Subagente '{nome}' criado em {f}. "
+                "Disponível imediatamente para delegação.")
+    except Exception as e:
+        return f"Erro ao criar subagente: {e}"
 
 
 def backup_file(path):
@@ -1008,6 +1894,75 @@ TOOLS = [
         },
         "skill": "memoria",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate",
+            "description": "DELEGA uma tarefa a um subagente especializado "
+                           "(ex.: revisor, pesquisador, analista). Use quando "
+                           "a tarefa for extensa, repetitiva ou puder ser "
+                           "feita em paralelo: o subagente trabalha sozinho "
+                           "com as próprias ferramentas e devolve o "
+                           "resultado final.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nome": {
+                        "type": "string",
+                        "description": "Nome do subagente (ex.: revisor). "
+                                       "Liste com /subagentes.",
+                    },
+                    "tarefa": {
+                        "type": "string",
+                        "description": "Tarefa completa e objetiva para o "
+                                       "subagente executar.",
+                    },
+                },
+                "required": ["nome", "tarefa"],
+            },
+        },
+        "skill": "subagentes",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_subagent",
+            "description": "CRIA UM NOVO SUBAGENTE especializado para o "
+                           "futuro. Salva um arquivo .md em ~/.send/subagents/ "
+                           "e o deixa disponível para delegação imediata. Use "
+                           "quando o usuário pedir um papel novo (ex.: "
+                           "'crie um subagente que revisa meu código', 'crie "
+                           "um subagente pesquisador').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nome": {
+                        "type": "string",
+                        "description": "Nome curto em minúsculas (ex.: revisor).",
+                    },
+                    "descricao": {
+                        "type": "string",
+                        "description": "Frase curta: o que o subagente faz.",
+                    },
+                    "ferramentas": {
+                        "type": "string",
+                        "description": "Opcional. Ferramentas permitidas "
+                                       "separadas por vírgula (ex.: "
+                                       "read_file, list_files). Vazio = sem "
+                                       "ferramentas; 'todas' = as mesmas do "
+                                       "agente principal.",
+                    },
+                    "instrucoes": {
+                        "type": "string",
+                        "description": "O papel e as regras do subagente, "
+                                       "detalhados.",
+                    },
+                },
+                "required": ["nome", "descricao", "instrucoes"],
+            },
+        },
+        "skill": "subagentes",
+    },
 ]
 
 def ask_yes_no(c, question, default=False):
@@ -1097,70 +2052,86 @@ def tool_run(args, c):
     return f"{tail}\n{out}" if out else f"{tail} (sem saída)"
 
 
+def _dispatch_tool(name, args, c, auto_confirm, cfg=None):
+    if name == "read_file":
+        return tool_read(args, c)
+    if name == "write_file":
+        if not auto_confirm:
+            if not ask_yes_no(c, f"Escrever arquivo '{args.get('path', '?')}'?"):
+                return None
+        return tool_write(args, c)
+    if name == "edit_file":
+        if not auto_confirm:
+            if not ask_yes_no(c, f"Editar arquivo '{args.get('path', '?')}'?"):
+                return None
+        return tool_edit(args, c)
+    if name == "list_files":
+        return tool_list(args, c)
+    if name == "find_files":
+        return tool_find(args, c)
+    if name == "run_command":
+        if not auto_confirm:
+            preview = args.get("command", "")[:80]
+            if not ask_yes_no(c, f"Executar comando: {preview}…"):
+                return None
+        return tool_run(args, c)
+    if name == "web_search":
+        return tool_web_search(args, c)
+    if name == "fetch_url":
+        return tool_fetch_url(args, c)
+    if name == "system_info":
+        return tool_system_info(args, c)
+    if name == "open_file":
+        return tool_open_file(args, c)
+    if name == "open_url":
+        return tool_open_url(args, c)
+    if name == "git_status":
+        return tool_git_status(args, c)
+    if name == "git_log":
+        return tool_git_log(args, c)
+    if name == "git_diff":
+        return tool_git_diff(args, c)
+    if name == "git_commit":
+        if not auto_confirm:
+            if not ask_yes_no(c, f"Criar commit: '{args.get('message', '')[:60]}'?"):
+                return None
+        return tool_git_commit(args, c)
+    if name == "list_processes":
+        return tool_list_processes(args, c)
+    if name == "kill_process":
+        if not auto_confirm:
+            alvo = args.get("pid") or args.get("name") or "?"
+            if not ask_yes_no(c, f"Encerrar processo '{alvo}'?"):
+                return None
+        return tool_kill_process(args, c)
+    if name == "read_memory":
+        return tool_read_memory(args, c)
+    if name == "remember":
+        return tool_remember(args, c)
+    if name == "create_skill":
+        return tool_create_skill(args, c, cfg)
+    if name == "delegate":
+        return tool_delegate(args, c, cfg)
+    if name == "create_subagent":
+        return tool_create_subagent(args, c, cfg)
+    if name.startswith("mcp_"):
+        return tool_mcp_call(name, args, c, cfg)
+    if name.startswith("skill_"):
+        return tool_custom_skill(name, args, c, cfg)
+    return f"Ferramenta desconhecida: {name}"
+
+
 def execute_tool(name, args, c, auto_confirm, cfg=None):
+    """Executa uma ferramenta, disparando os hooks PreToolUse/PostToolUse."""
+    run_hooks("PreToolUse", c, cfg, tool=name,
+              args=json.dumps(args, ensure_ascii=False)[:2000])
     try:
-        if name == "read_file":
-            return tool_read(args, c)
-        if name == "write_file":
-            if not auto_confirm:
-                if not ask_yes_no(c, f"Escrever arquivo '{args.get('path', '?')}'?"):
-                    return None
-            return tool_write(args, c)
-        if name == "edit_file":
-            if not auto_confirm:
-                if not ask_yes_no(c, f"Editar arquivo '{args.get('path', '?')}'?"):
-                    return None
-            return tool_edit(args, c)
-        if name == "list_files":
-            return tool_list(args, c)
-        if name == "find_files":
-            return tool_find(args, c)
-        if name == "run_command":
-            if not auto_confirm:
-                preview = args.get("command", "")[:80]
-                if not ask_yes_no(c, f"Executar comando: {preview}…"):
-                    return None
-            return tool_run(args, c)
-        if name == "web_search":
-            return tool_web_search(args, c)
-        if name == "fetch_url":
-            return tool_fetch_url(args, c)
-        if name == "system_info":
-            return tool_system_info(args, c)
-        if name == "open_file":
-            return tool_open_file(args, c)
-        if name == "open_url":
-            return tool_open_url(args, c)
-        if name == "git_status":
-            return tool_git_status(args, c)
-        if name == "git_log":
-            return tool_git_log(args, c)
-        if name == "git_diff":
-            return tool_git_diff(args, c)
-        if name == "git_commit":
-            if not auto_confirm:
-                if not ask_yes_no(c, f"Criar commit: '{args.get('message', '')[:60]}'?"):
-                    return None
-            return tool_git_commit(args, c)
-        if name == "list_processes":
-            return tool_list_processes(args, c)
-        if name == "kill_process":
-            if not auto_confirm:
-                alvo = args.get("pid") or args.get("name") or "?"
-                if not ask_yes_no(c, f"Encerrar processo '{alvo}'?"):
-                    return None
-            return tool_kill_process(args, c)
-        if name == "read_memory":
-            return tool_read_memory(args, c)
-        if name == "remember":
-            return tool_remember(args, c)
-        if name == "create_skill":
-            return tool_create_skill(args, c, cfg)
-        if name.startswith("skill_"):
-            return tool_custom_skill(name, args, c, cfg)
-        return f"Ferramenta desconhecida: {name}"
+        result = _dispatch_tool(name, args, c, auto_confirm, cfg)
     except Exception as e:
-        return f"Erro ao executar {name}: {e}"
+        result = f"Erro ao executar {name}: {e}"
+    run_hooks("PostToolUse", c, cfg, tool=name,
+              result=str(result)[:2000])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1686,7 +2657,7 @@ def summarize_conversation(sess, c):
 
 
 def call_model(sess, tools_enabled, c, cfg):
-    """Chama a API com streaming. Retorna (conteúdo, lista de tool_calls)."""
+    """Chama a API com streaming. Retorna (conteúdo, tool_calls, reasoning)."""
     if sess.model_id is None:
         sess.model_id = resolve_model(cfg, c)
     extra = getattr(sess, "extra_system", "")
@@ -1695,8 +2666,12 @@ def call_model(sess, tools_enabled, c, cfg):
         extra = (f"Resumo de mensagens anteriores desta conversa (não "
                  f"responda ao resumo, apenas use como contexto):\n{summary}"
                  + (("\n\n" + extra) if extra else ""))
-    messages = [{"role": "system",
-                 "content": system_prompt(cfg, extra)}] + sess.messages
+    system_override = getattr(sess, "system_override", None)
+    if system_override:
+        system_text = system_override
+    else:
+        system_text = system_prompt(cfg, extra)
+    messages = [{"role": "system", "content": system_text}] + sess.messages
     payload = {
         "model": sess.model_id,
         "messages": messages,
@@ -1704,7 +2679,8 @@ def call_model(sess, tools_enabled, c, cfg):
         "temperature": cfg["temperature"],
     }
     if tools_enabled:
-        payload["tools"] = get_tools(cfg)
+        custom = getattr(sess, "custom_tools", None)
+        payload["tools"] = get_tools(cfg) if custom is None else custom
         payload["tool_choice"] = "auto"
     if cfg["thinking"]:
         payload["reasoning_effort"] = cfg["reasoning_effort"]
@@ -1730,11 +2706,13 @@ def call_model(sess, tools_enabled, c, cfg):
 
 
 def _consume_stream(stream, c, cfg):
-    """Lê um stream SSE e devolve (conteúdo, tool_calls) já formatados."""
+    """Lê um stream SSE e devolve (conteúdo, tool_calls, reasoning)."""
     content_parts = []
     reasoning_parts = []
     tool_calls = {}
     order = []
+    printer = MarkdownPrinter(c)
+    think_on = False  # indicador "🧠 raciocinando…" visível
     try:
         for raw in stream:
             if raw == "[DONE]":
@@ -1746,15 +2724,21 @@ def _consume_stream(stream, c, cfg):
             for ch in evt.get("choices", []):
                 delta = ch.get("delta", {}) or {}
                 if delta.get("content"):
+                    if think_on:
+                        sys.stdout.write("\r" + " " * 24 + "\r")
+                        sys.stdout.flush()
+                        think_on = False
                     piece = delta["content"]
                     content_parts.append(piece)
-                    sys.stdout.write(piece)
+                    printer.write(piece)
                     sys.stdout.flush()
-                if delta.get("reasoning_content") and cfg["show_reasoning"] and c.enabled:
+                if delta.get("reasoning_content") and cfg["show_reasoning"]:
                     piece = delta["reasoning_content"]
                     reasoning_parts.append(piece)
-                    sys.stdout.write(c.dim(piece))
-                    sys.stdout.flush()
+                    if c.enabled and not think_on and not content_parts:
+                        sys.stdout.write("\r" + c.dim("🧠 raciocinando… "))
+                        sys.stdout.flush()
+                        think_on = True
                 for tc in delta.get("tool_calls") or []:
                     idx = tc.get("index", 0)
                     if idx not in tool_calls:
@@ -1771,13 +2755,18 @@ def _consume_stream(stream, c, cfg):
                     if fn.get("arguments"):
                         tool_calls[idx]["function"]["arguments"] += fn["arguments"]
     except KeyboardInterrupt:
-        print()
-        return "".join(content_parts), []
+        if think_on:
+            sys.stdout.write("\r" + " " * 24 + "\r")
+            sys.stdout.flush()
+        printer.finish()
+        return "".join(content_parts), [], "".join(reasoning_parts)
 
-    if content_parts:
-        sys.stdout.write("\n")
+    if think_on:
+        sys.stdout.write("\r" + " " * 24 + "\r")
         sys.stdout.flush()
-    return "".join(content_parts), [tool_calls[i] for i in order]
+    printer.finish()
+    return ("".join(content_parts), [tool_calls[i] for i in order],
+            "".join(reasoning_parts))
 
 
 def run_agent(sess, tools_enabled, c, auto_confirm):
@@ -1785,7 +2774,9 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
     cfg = sess.cfg
     content = ""
     for _ in range(MAX_TOOL_ROUNDS):
-        content, calls = call_model(sess, tools_enabled, c, cfg)
+        content, calls, reasoning = call_model(sess, tools_enabled, c, cfg)
+        if reasoning and getattr(sess, "last_reasoning", "") != reasoning:
+            sess.last_reasoning = reasoning
         if not calls:
             if content:
                 sess.messages.append({"role": "assistant", "content": content})
@@ -1818,13 +2809,16 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
                     args = {"_raw": raw}
             except Exception:
                 args = {"_raw": raw}
-            print(c.yellow(f"  🔧 {name} {compact_args(args)}"))
+            print(c.cyan("  ╭─ ") + tool_icon(name) + " " +
+                  c.bold(name) + c.dim(" " + compact_args(args)))
             result = execute_tool(name, args, c, auto_confirm, sess.cfg)
             if result is None:
                 result = (
                     "O usuário recusou executar esta ferramenta. "
                     "Explique e prossiga sem executá-la."
                 )
+            prev = result.split("\n")[0][:110]
+            print(c.dim("  ╰─ " + (prev or "(sem saída)")))
             sess.messages.append(
                 {"role": "tool", "tool_call_id": tc["id"] or f"call_{len(sess.messages)}",
                  "content": result}
@@ -1874,27 +2868,26 @@ def run_workflow(sess, task, c, cfg):
 
     # ---- 1. PLANEJAR ----
     print()
-    print(c.bold(c.cyan("📋 ETAPA 1/4 — PLANEJAR")))
-    print(c.dim("   Separando a tarefa em etapas…"))
-    plan_sess = Session(cfg, c)
-    cfg["mode"] = "workflow_plan"
-    try:
-        plan = ask_model(plan_sess, False, c, auto) or ""
-    finally:
-        cfg["mode"] = mode_bak
+    panel("📋 ETAPA 1/4 — PLANEJAR", "Separando a tarefa em etapas…", c)
+    with Spinner(c, "planejando…"):
+        plan_sess = Session(cfg, c)
+        cfg["mode"] = "workflow_plan"
+        try:
+            plan = ask_model(plan_sess, False, c, auto) or ""
+        finally:
+            cfg["mode"] = mode_bak
     plan = plan.strip()
     if not plan:
         plan = "(o modelo não gerou um plano)"
     n_steps = _count_plan_steps(plan)
     print()
-    print(c.bold("📋 Plano:"))
-    print(plan)
+    panel("📋 Plano", plan, c, color="cyan", width=72)
     if n_steps >= 5:
-        print(c.yellow(f"⚠ Tarefa grande identificada — dividida em {n_steps} "
+        print(c.yellow(f"  ⚠ Tarefa grande identificada — dividida em {n_steps} "
                        "etapas organizadas por fase."))
     if not auto and sys.stdin.isatty():
         if not ask_yes_no(c, "Aprovar este plano e começar a construir?"):
-            print(c.yellow("Plano recusado pelo usuário. Nada foi construído."))
+            print(c.yellow("  Plano recusado pelo usuário. Nada foi construído."))
             sess.messages.append({"role": "user", "content": task})
             sess.messages.append({"role": "assistant",
                                   "content": "Plano recusado pelo usuário."})
@@ -1902,8 +2895,7 @@ def run_workflow(sess, task, c, cfg):
 
     # ---- 2. CONSTRUIR ----
     print()
-    print(c.bold(c.cyan("🔨 ETAPA 2/4 — CONSTRUIR")))
-    print(c.dim("   Executando o plano passo a passo…"))
+    panel("🔨 ETAPA 2/4 — CONSTRUIR", "Executando o plano passo a passo…", c)
     build_sess = Session(cfg, c)
     build_sess.messages = [
         {"role": "user", "content": task},
@@ -1927,7 +2919,8 @@ def run_workflow(sess, task, c, cfg):
     report = ""
     for cycle in range(1, WORKFLOW_MAX_FIX_CYCLES + 1):
         print()
-        print(c.bold(c.cyan("✅ ETAPA 3/4 — VERIFICAR")))
+        panel("✅ ETAPA 3/4 — VERIFICAR",
+              f"Conferindo o que foi construído (ciclo {cycle})…", c, color="green")
         ctx = (f"{task}\n\nO que foi construído até agora:\n"
                f"{build_summary[:3000]}\n")
         if cycle > 1:
@@ -1950,13 +2943,14 @@ def run_workflow(sess, task, c, cfg):
         ok = upper.startswith(("VERIFICAÇÃO OK", "VERIFICACAO OK", "✅"))
         if ok or "PROBLEMAS" not in upper:
             print()
-            print(c.green("✅ Verificação concluída."))
+            print(c.green("  ✅ Verificação concluída."))
             print(c.dim(report[:500]))
             break
         # precisa corrigir
         print()
-        print(c.bold(c.yellow("🔧 ETAPA 4/4 — CORRIGIR")))
-        print(c.dim(f"   Ciclo de correção {cycle}/{WORKFLOW_MAX_FIX_CYCLES}…"))
+        panel(f"🔧 ETAPA 4/4 — CORRIGIR",
+              f"Ciclo de correção {cycle}/{WORKFLOW_MAX_FIX_CYCLES}…", c,
+              color="yellow")
         f_sess = Session(cfg, c)
         f_sess.messages = [{
             "role": "user",
@@ -2053,6 +3047,7 @@ COMMANDS = [
     ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (nativas e criadas por você)", "básico"),
     ("/memoria", "/memoria", "Mostra a memória de longo prazo (~/.send/memoria.md)", "básico"),
     ("/resumo", "/resumo", "Resume a conversa atual (economiza contexto)", "básico"),
+    ("/pensamento", "/pensamento", "Mostra o último pensamento do modelo (expandido)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
     ("/model", "/model [nome]", "Mostra ou troca o modelo (ex.: /model qwen2.5-coder-7b)", "modelo"),
@@ -2070,6 +3065,9 @@ COMMANDS = [
     ("/load", "/load arquivo", "Carrega uma conversa salva", "sessão"),
     ("/backups", "/backups [restore n]", "Lista/restaura backups de arquivos alterados", "sistema"),
     ("/contexto", "/contexto [on|off]", "Liga/desliga o contexto do projeto no prompt", "sistema"),
+    ("/subagentes", "/subagentes [nome] [tarefa]", "Lista os subagentes ou roda um (ex.: /subagentes revisor revise este código)", "sistema"),
+    ("/mcp", "/mcp [nome|reload]", "Mostra os servidores MCP (ferramentas externas) e reconecta", "sistema"),
+    ("/hooks", "/hooks", "Mostra os hooks configurados (~/.send/hooks.json)", "sistema"),
     ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o servidor", "sistema"),
     ("/update", "/update", "Atualiza o SEND para a versão mais recente", "sistema"),
 ]
@@ -2094,6 +3092,26 @@ def build_help_text():
 
 
 HELP_TEXT = build_help_text()
+
+
+def print_help(c):
+    """Ajuda bonita, organizada por categoria com cores."""
+    print()
+    panel("⚡ SEND — AJUDA", "digite / e Enter para abrir a paleta interativa", c,
+           width=74)
+    for cat in COMMAND_CATEGORIES:
+        print()
+        print(c.bold(c.cyan("  " + cat.upper())))
+        for name, syntax, desc, ccat in COMMANDS:
+            if ccat == cat:
+                print(f"    {c.bold(syntax):<38} {c.dim(desc)}")
+    print()
+    print(c.bold(c.cyan("  DICAS")))
+    print(c.dim("    • digite / e Enter → paleta de comandos interativa (setas ↑↓)"))
+    print(c.dim("    • Tab completa comandos e caminhos de arquivos"))
+    print(c.dim("    • use \\ no fim da linha para continuar em outra linha"))
+    print(c.dim("    • Ctrl+C interrompe a resposta; Ctrl+C de novo sai"))
+    print()
 
 
 def _read_nonblock(fd):
@@ -2134,10 +3152,13 @@ def show_command_menu(c):
         out = []
         for i, item in enumerate(flat):
             if item[0] == "cat":
-                out.append(c.cyan(c.bold("  " + item[1].upper())))
+                out.append(c.bold(c.magenta("  " + item[1].upper())))
             else:
                 marker = c.bold(c.cyan("❯")) if i == idx else " "
-                out.append(f" {marker} {item[2]:<34} {c.dim(item[3])}")
+                line = f" {marker} {item[2]:<34} {c.dim(item[3])}"
+                if i == idx and c.enabled:
+                    line = "\033[48;5;24m" + line + "\033[0m"
+                out.append(line)
         return out
 
     # Fallback para Windows/sem TTY: lista numerada
@@ -2172,7 +3193,7 @@ def show_command_menu(c):
     idx = 1  # primeiro comando (índice 0 é o cabeçalho da 1ª categoria)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
-    sys.stdout.write("\n")
+    sys.stdout.write("\n" + c.bold(c.cyan("  ⚡ COMANDOS — ↑↓ navegar · Enter executar · Esc/q fechar")) + "\n\n")
     try:
         tty.setraw(fd)
         lines = draw(idx)
@@ -2223,7 +3244,7 @@ def show_command_menu(c):
                     sys.stdout.write("\r\n")
                     sys.stdout.flush()
                     return cmd_items[num - 1][1]
-            sys.stdout.write("\r\x1b[K" + ("\x1b[1A\r\x1b[K" * (len(flat) - 1)))
+            sys.stdout.write("\r\x1b[K" + ("\x1b[1A\r\x1b[K" * (len(flat) + 2)))
             lines = draw(idx)
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
@@ -2247,7 +3268,7 @@ EDITABLE_CONFIG = {
     "base_url": str, "api_key": str, "model": str, "temperature": float,
     "thinking": bool, "reasoning_effort": str, "show_reasoning": bool,
     "auto_confirm": bool, "auto_backend": bool, "project_context": bool,
-    "auto_summarize": bool, "mode": str,
+    "auto_summarize": bool, "mode": str, "mcp_enabled": bool, "hooks": bool,
 }
 
 
@@ -2265,16 +3286,16 @@ def cmd_config(sess, rest, c, tools_enabled):
     parts = rest.split()
 
     if not parts:
-        print(c.bold("Configuração atual:"))
+        lines = []
         for k, v in cfg.items():
             if k == "skills":
                 continue
             mark = "" if k in EDITABLE_CONFIG else c.dim(" (fixa)")
-            print(f"  {k:<18} = {v}{mark}")
-        print()
-        print("  Edite com: /config <chave> <valor>")
-        print(f"  Ex.: /config temperature 0.3 • /config thinking true • "
-              f"/config base_url http://127.0.0.1:1234")
+            lines.append(f"{k:<18} = {v}{mark}")
+        lines.append("")
+        lines.append("Edite com: /config <chave> <valor>")
+        lines.append("Ex.: /config temperature 0.3 · /config thinking true")
+        panel("⚙ CONFIGURAÇÃO", "\n".join(lines), c, width=70)
         return False, tools_enabled
 
     key = parts[0]
@@ -2310,15 +3331,17 @@ def cmd_backups(sess, rest, c, tools_enabled):
         return False, tools_enabled
 
     if not backups:
-        print("Nenhum backup ainda. Os arquivos alterados pelo SEND são "
-              f"salvos automaticamente em {BACKUP_DIR} antes de mudar.")
-        print("  Use: /backups restore <n> para restaurar.")
+        panel("💾 BACKUPS",
+              "Nenhum backup ainda.\n\n"
+              "Os arquivos alterados pelo SEND são salvos automaticamente\n"
+              f"em {BACKUP_DIR} antes de mudar.\n\n"
+              "Use: /backups restore <n> para restaurar.", c, width=70)
         return False, tools_enabled
-    print(c.bold(f"Backups ({len(backups)}):"))
-    for i, b in enumerate(backups, 1):
-        print(f"  {i:>3}. {b['ts']}  {b['original']}")
-    print()
-    print("  Restaure com: /backups restore <n>")
+    lines = [f"{i:>3}. {b['ts']}  {b['original']}" for i, b in
+             enumerate(backups, 1)]
+    lines.append("")
+    lines.append("Restaure com: /backups restore <n>")
+    panel(f"💾 BACKUPS ({len(backups)})", "\n".join(lines), c, width=74)
     return False, tools_enabled
 
 
@@ -2354,22 +3377,22 @@ def cmd_skills(sess, rest, c, tools_enabled):
     custom = load_custom_skills()
 
     if not parts:
-        print("Skills do SEND:")
+        lines = []
         for name in SKILL_ORDER:
             mark = "✅" if name in skills else "⬜"
-            print(f"  {mark} {name:<10} {SKILLS[name]}")
+            lines.append(f"{mark} {name:<10} {SKILLS[name]}")
         if custom:
-            print()
-            print("  ⭐ Personalizadas (criadas por você):")
+            lines.append("")
+            lines.append("⭐ Personalizadas (criadas por você):")
             for cs in custom:
                 mark = "✅" if cs["name"] in skills else "⬜"
-                print(f"  {mark} {cs['name']:<10} {cs['description']}")
-        print()
-        print("  Use: /skills <nome> [on|off]   (ex.: /skills internet off)")
-        print("       /skills on | off          (liga/desliga todas)")
-        print("  Para criar uma nova skill, peça ao SEND:")
-        print("    ex.: \"crie uma skill para formatar código Python\"")
-        print(f"  Skills criadas ficam em: {SKILLS_DIR}")
+                lines.append(f"{mark} {cs['name']:<10} {cs['description']}")
+        lines.append("")
+        lines.append("Use: /skills <nome> [on|off]   (ex.: /skills internet off)")
+        lines.append("     /skills on | off          (liga/desliga todas)")
+        lines.append("Crie novas skills pedindo ao SEND, ex.:")
+        lines.append("  \"crie uma skill para formatar código Python\"")
+        panel("🧰 SKILLS DO SEND", "\n".join(lines), c, width=74)
         return False, tools_enabled
 
     all_on = list(SKILL_ORDER) + [cs["name"] for cs in custom]
@@ -2415,6 +3438,122 @@ def cmd_skills(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+def cmd_subagentes(sess, rest, c, tools_enabled):
+    """Lista os subagentes ou roda um: /subagentes <nome> <tarefa>."""
+    subagents = load_subagents()
+    parts = rest.split(None, 1)
+
+    if not parts:
+        if not subagents:
+            panel("🤝 SUBAGENTES",
+                  "Nenhum subagente ainda.\n\n"
+                  f"Crie um arquivo .md em {SUBAGENTS_DIR} ou peça ao SEND:\n"
+                  "  \"crie um subagente que revisa meu código\"\n\n"
+                  "Rode um com: /subagentes <nome> <tarefa>", c, width=72)
+            return False, tools_enabled
+        lines = []
+        for sa in subagents:
+            if sa["tools"] is None:
+                ftools = "padrão (leitura + internet)"
+            elif sa["tools"]:
+                ftools = ", ".join(sa["tools"])
+            else:
+                ftools = "nenhuma (só conversa)"
+            lines.append(f"• {sa['name']} — {sa['description']}")
+            lines.append(f"    ferramentas: {ftools}")
+        lines.append("")
+        lines.append("Rode um subagente: /subagentes <nome> <tarefa>")
+        lines.append("Crie novos pedindo ao SEND, ex.:")
+        lines.append("  \"crie um subagente que revisa meu código\"")
+        panel(f"🤝 SUBAGENTES ({len(subagents)})", "\n".join(lines), c,
+              width=74)
+        return False, tools_enabled
+
+    name = parts[0].lower()
+    tarefa = parts[1].strip() if len(parts) > 1 else ""
+    if not tarefa:
+        sa = next((s for s in subagents if s["name"] == name), None)
+        if sa:
+            print(f"  {name}: {sa['description']}")
+            print(f"  Arquivo: {SUBAGENTS_DIR / (name + '.md')}")
+        else:
+            print(c.yellow(f"Subagente '{name}' não existe. Use /subagentes "
+                           "para listar."))
+        return False, tools_enabled
+    print()
+    print(run_subagent(name, tarefa, c, sess.cfg))
+    print()
+    return False, tools_enabled
+
+
+def cmd_mcp(sess, rest, c, tools_enabled):
+    """Mostra os servidores MCP; /mcp reload reconecta; /mcp <nome> detalha."""
+    arg = rest.strip().lower()
+    if arg == "reload":
+        for name in list(_MCP["servers"]):
+            mcp_disconnect(name)
+        mcp_start_all(c)
+        return False, tools_enabled
+
+    servers = _MCP["servers"] if _MCP.get("started") else {}
+    if not servers:
+        panel("🔌 MCP",
+              "Nenhum servidor MCP configurado.\n\n"
+              f"Crie {MCP_CONFIG_PATH} com, ex.:\n"
+              '  {"servers": {"arquivos": {"command": "npx", "args": '
+              '["-y", "@modelcontextprotocol/server-filesystem", "/"]}}}\n\n'
+              "Depois rode /mcp reload. As ferramentas aparecem como\n"
+              "mcp_<servidor>_<ferramenta> para o modelo usar.", c, width=76)
+        return False, tools_enabled
+
+    lines = []
+    for name, srv in servers.items():
+        if srv.get("error"):
+            lines.append(f"❌ {name} — erro: {srv['error']}")
+            continue
+        ftools = [t["function"]["name"] for t in srv.get("tools", [])]
+        lines.append(f"✅ {name} — {len(ftools)} ferramenta(s)")
+        if arg == name:
+            for t in ftools:
+                lines.append(f"    • {t}")
+    if arg not in servers and arg:
+        print(c.yellow(f"Servidor MCP desconhecido: {arg}"))
+    panel("🔌 MCP", "\n".join(lines), c, width=76)
+    return False, tools_enabled
+
+
+def cmd_hooks(sess, rest, c, tools_enabled):
+    """Mostra os hooks configurados em ~/.send/hooks.json."""
+    cfg = sess.cfg
+    lines = [f"Eventos: {'✅ ligados' if cfg.get('hooks', True) else '⛔ desligados'}"
+             f"  (desligue com: /config hooks false)",
+             f"Arquivo: {HOOKS_PATH}", ""]
+    try:
+        if HOOKS_PATH.exists():
+            data = json.loads(HOOKS_PATH.read_text(encoding="utf-8"))
+            found = False
+            for ev in ("SessionStart", "PreToolUse", "PostToolUse",
+                       "SessionEnd"):
+                cmds = data.get(ev) or []
+                if not cmds:
+                    continue
+                found = True
+                lines.append(f"  {ev} ({len(cmds)} comando(s)):")
+                for cmd in cmds[:5]:
+                    lines.append(f"    • {cmd}")
+            if not found:
+                lines.append("  Nenhum evento configurado ainda.")
+        else:
+            lines.append("  Nenhum hook configurado ainda. Exemplo:")
+            lines.append('  {"PreToolUse": ["echo tool=$SEND_TOOL >> '
+                         '~/.send/hooks.log"],')
+            lines.append('   "SessionEnd": ["echo fim >> ~/.send/hooks.log"]}')
+    except Exception as e:
+        lines.append(c.yellow(f"  Erro lendo hooks.json: {e}"))
+    panel("🪝 HOOKS", "\n".join(lines), c, width=76)
+    return False, tools_enabled
+
+
 def handle_command(sess, line, c, tools_enabled):
     """Processa um comando iniciado com '/'. Retorna (sair?, tools_enabled)."""
     cfg = sess.cfg
@@ -2425,7 +3564,7 @@ def handle_command(sess, line, c, tools_enabled):
         print("Até logo! 👋")
         return True, tools_enabled
     if cmd == "/help":
-        print(HELP_TEXT)
+        print_help(c)
         return False, tools_enabled
     if cmd == "/clear":
         sess.messages = []
@@ -2487,13 +3626,20 @@ def handle_command(sess, line, c, tools_enabled):
     if cmd == "/memoria":
         text = memory_summary(limit=8000)
         if not text:
-            print("🧠 A memória de longo prazo está vazia.")
-            print(f"   Arquivo: {MEMORY_PATH}")
-            print("   O SEND grava aprendizado sozinho com a ferramenta "
-                  "'remember'.")
+            panel("🧠 MEMÓRIA DE LONGO PRAZO",
+                  "A memória ainda está vazia.\n"
+                  "O SEND grava aprendizado sozinho com a ferramenta 'remember'.\n"
+                  f"Arquivo: {MEMORY_PATH}", c, width=72)
         else:
-            print(c.bold(f"🧠 Memória de longo prazo ({MEMORY_PATH}):"))
-            print(text)
+            panel(f"🧠 MEMÓRIA ({MEMORY_PATH.name})", text, c, width=74)
+        return False, tools_enabled
+    if cmd == "/pensamento":
+        text = (getattr(sess, "last_reasoning", "") or "").strip()
+        if not text:
+            print(c.yellow("Nenhum pensamento registrado nesta sessão ainda. "
+                           "Ative com --thinking e pergunte algo."))
+        else:
+            panel("🧠 PENSAMENTO DO MODELO", text, c, color="magenta", width=78)
         return False, tools_enabled
     if cmd == "/resumo":
         if sess.summary:
@@ -2547,16 +3693,26 @@ def handle_command(sess, line, c, tools_enabled):
         return False, tools_enabled
     if cmd == "/status":
         skills = cfg.get("skills", SKILL_ORDER)
-        print(f"  Servidor : {cfg['base_url']}")
-        print(f"  Modelo   : {sess.model_id or cfg['model'] or 'auto'}")
-        print(f"  Modo     : {cfg['mode']}")
-        print(f"  Ferramentas: {'sim' if tools_enabled else 'não'}")
-        print(f"  Pensamento : {'sim' if cfg['thinking'] else 'não'}")
-        print(f"  Skills   : {', '.join(skills) if skills else 'nenhuma'}")
-        print(f"  Config   : {CONFIG_PATH}")
+        lines = [
+            f"Servidor     : {cfg['base_url']}",
+            f"Modelo       : {sess.model_id or cfg['model'] or 'auto'}",
+            f"Modo         : {cfg['mode']}",
+            f"Ferramentas  : {'✅ sim' if tools_enabled else '⛔ não'}",
+            f"Pensamento   : {'✅ sim' if cfg['thinking'] else '⛔ não'}",
+            f"Skills       : {', '.join(skills) if skills else 'nenhuma'}",
+            f"MCP          : {mcp_summary(cfg)}",
+            f"Config       : {CONFIG_PATH}",
+        ]
+        panel("🖥 STATUS DA SESSÃO", "\n".join(lines), c, width=70)
         return False, tools_enabled
     if cmd == "/skills":
         return cmd_skills(sess, rest, c, tools_enabled)
+    if cmd == "/subagentes":
+        return cmd_subagentes(sess, rest, c, tools_enabled)
+    if cmd == "/mcp":
+        return cmd_mcp(sess, rest, c, tools_enabled)
+    if cmd == "/hooks":
+        return cmd_hooks(sess, rest, c, tools_enabled)
     if cmd == "/save":
         save_session(sess, rest or None)
         return False, tools_enabled
@@ -2613,19 +3769,33 @@ def read_input(prompt, c):
     return line
 
 
+def _rl_prompt(s):
+    """Envolve escapes ANSI com \001..\002 para o readline medir o prompt
+    corretamente (sem isso, prompts coloridos são redesenhadados errado)."""
+    if not readline:
+        return s
+    return re.sub(r"(\x1b\[[0-9;]*m)", r"\001\1\002", s)
+
+
 def make_prompt(c, sess):
-    badge = sess.model_id or "?"
+    badge = (sess.model_id or "?").rsplit("/", 1)[-1][:24]
     mode = sess.cfg["mode"].upper()
+    mode_icons = {"CODING": "🛠", "CHAT": "💬", "PLAN": "📋", "WORKFLOW": "🔁"}
+    mi = mode_icons.get(mode, "❯")
     think = " 🧠" if sess.cfg["thinking"] else ""
-    return f"{c.cyan('send')}{c.dim(f'({badge}·{mode})')}{think} {c.bold('❯')} "
+    if c.enabled:
+        prompt = (f"{c.bold(c.cyan('send'))}{c.dim('(' + badge + '·')}"
+                  f"{mi}{c.dim(mode + ')')}{think} {c.bold('❯')} ")
+        return _rl_prompt(prompt)
+    return f"send({badge}·{mode}){think} ❯ "
 
 
 def repl(sess, c, tools_enabled):
     cfg = sess.cfg
     print()
-    print(c.bold(c.cyan(f" ⚡ SEND v{VERSION}")) + " — assistente de IA no terminal (LM Studio)")
-    print(c.dim("   Digite / para abrir a paleta de comandos • /help • Ctrl+C para sair"))
-    print()
+    banner(c, model=(sess.model_id or cfg.get("model") or "auto"),
+           mode=cfg["mode"])
+    run_hooks("SessionStart", c, sess.cfg, prompt="modo interativo")
 
     if readline:
         try:
@@ -2671,8 +3841,9 @@ def repl(sess, c, tools_enabled):
             try:
                 run_workflow(sess, line, c, cfg)
             except urllib.error.URLError as e:
-                print(c.red(f"✗ Não consegui conectar ao servidor ({cfg['base_url']})."))
-                print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+                nice_error(c, "Servidor offline",
+                           f"{cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                           "Rode 'send --doctor' para diagnosticar.")
             except urllib.error.HTTPError as e:
                 print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
                 print(c.red(e.read().decode("utf-8", "replace")[:500]))
@@ -2691,8 +3862,9 @@ def repl(sess, c, tools_enabled):
             content = ask_model(sess, tools_enabled and cfg["mode"] != "plan", c,
                                 getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         except urllib.error.URLError as e:
-            print(c.red(f"✗ Não consegui conectar ao servidor ({cfg['base_url']})."))
-            print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+            nice_error(c, "Servidor offline",
+                       f"{cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                       "Rode 'send --doctor' para diagnosticar.")
         except urllib.error.HTTPError as e:
             print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
             print(c.red(e.read().decode("utf-8", "replace")[:500]))
@@ -2707,14 +3879,19 @@ def repl(sess, c, tools_enabled):
                 dt = time.time() - t0
                 tokens = max(1, len(content) // 4)
                 print(c.dim(f"    ⏱ {dt:.1f}s · ≈{tokens} tokens"))
+                show_thinking_panel(sess, c, cfg)
+                offer_save_code(content, c, cfg,
+                                getattr(sess, "auto_confirm", cfg["auto_confirm"]))
         if sess.messages and sess.messages[-1]["role"] == "assistant":
             save_history([sess.messages[-1]])
+        hr(c)
 
     if readline:
         try:
             readline.write_history_file(str(INPUT_HISTORY))
         except Exception:
             pass
+    run_hooks("SessionEnd", c, sess.cfg)
     return 0
 
 
@@ -2733,8 +3910,9 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
         try:
             run_workflow(sess, prompt, c, sess.cfg)
         except urllib.error.URLError as e:
-            print(c.red(f"✗ Não consegui conectar ao servidor ({sess.cfg['base_url']})."))
-            print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+            nice_error(c, "Servidor offline",
+                       f"{sess.cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                       "Rode 'send --doctor' para diagnosticar.")
             return 2
         except urllib.error.HTTPError as e:
             print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
@@ -2748,6 +3926,7 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
             return 1
         return 0
 
+    run_hooks("SessionStart", c, sess.cfg, prompt=prompt[:200])
     sess.messages.append({"role": "user", "content": prompt})
     save_history([{"role": "user", "content": prompt}])
     t0 = time.time()
@@ -2755,8 +3934,9 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
         content = ask_model(sess, tools_enabled and sess.cfg["mode"] != "plan",
                             c, auto_confirm)
     except urllib.error.URLError as e:
-        print(c.red(f"✗ Não consegui conectar ao servidor ({sess.cfg['base_url']})."))
-        print(c.yellow("  LM Studio está rodando? Use 'send --doctor' para diagnosticar."))
+        nice_error(c, "Servidor offline",
+                   f"{sess.cfg['base_url']} — LM Studio/Ollama está rodando?\n"
+                   "Rode 'send --doctor' para diagnosticar.")
         return 2
     except urllib.error.HTTPError as e:
         print(c.red(f"✗ Erro HTTP {e.code} do servidor:"))
@@ -2773,21 +3953,26 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
             dt = time.time() - t0
             tokens = max(1, len(content) // 4)
             print(c.dim(f"    ⏱ {dt:.1f}s · ≈{tokens} tokens"))
+            show_thinking_panel(sess, c, sess.cfg)
+            offer_save_code(content, c, sess.cfg, auto_confirm)
     if sess.messages and sess.messages[-1]["role"] == "assistant":
         save_history([sess.messages[-1]])
+    run_hooks("SessionEnd", c, sess.cfg)
     return 0
 
 
 def doctor(cfg, c):
-    print(c.bold("SEND — diagnóstico"))
-    print(f"  Versão   : {VERSION}")
-    print(f"  Python   : {sys.version.split()[0]} ({sys.platform})")
-    print(f"  Config   : {CONFIG_PATH} {'(existe)' if CONFIG_PATH.exists() else '(não criada ainda)'}")
-    print(f"  Servidor : {cfg['base_url']}")
-    print(f"  Modelo   : {cfg['model'] or 'auto (primeiro disponível)'}")
-    print(f"  Modo     : {cfg['mode']} | Pensamento: {'ligado' if cfg['thinking'] else 'desligado'}")
+    lines = [
+        f"Versão   : {VERSION}",
+        f"Python   : {sys.version.split()[0]} ({sys.platform})",
+        f"Config   : {CONFIG_PATH} {'✅' if CONFIG_PATH.exists() else '—'}",
+        f"Servidor : {cfg['base_url']}",
+        f"Modelo   : {cfg['model'] or 'auto (primeiro disponível)'}",
+        f"Modo     : {cfg['mode']} · Pensamento: {'ligado' if cfg['thinking'] else 'desligado'}",
+    ]
+    panel("🔍 SEND — DIAGNÓSTICO", "\n".join(lines), c, width=70)
     print()
-    print(c.bold("Testando conexão com o LM Studio…"))
+    small("Testando conexão", cfg["base_url"], c)
     t0 = time.time()
     try:
         models = list_models(cfg["base_url"], cfg["api_key"])
@@ -2802,12 +3987,13 @@ def doctor(cfg, c):
         print(c.yellow("     Carregue um modelo no LM Studio e tente de novo."))
         return 1
     except urllib.error.URLError as e:
-        print(c.red(f"  ✗ Não foi possível conectar em {cfg['base_url']} ({e.reason})"))
-        print(c.yellow("  Como resolver:"))
-        print(c.yellow("    1. Abra o LM Studio e carregue um modelo (ex.: Qwen2.5 Coder 7B)"))
-        print(c.yellow("    2. Clique na aba 'Developer' (Servidor Local) → 'Start Server'"))
-        print(c.yellow("    3. Confirme que a porta é 1234"))
-        print(c.yellow("    4. Rode 'send --doctor' novamente"))
+        nice_error(c, "Não foi possível conectar",
+                   f"{cfg['base_url']} ({e.reason})\n\n"
+                   "Como resolver:\n"
+                   "  1. Abra o LM Studio e carregue um modelo (ex.: Qwen2.5 Coder 7B)\n"
+                   "  2. Clique na aba 'Developer' (Servidor Local) → 'Start Server'\n"
+                   "  3. Confirme que a porta é 1234\n"
+                   "  4. Rode 'send --doctor' novamente")
         return 1
     except Exception as e:
         print(c.red(f"  ✗ Erro: {e}"))
@@ -2910,6 +4096,9 @@ def parse_args(argv=None):
                          "(padrão: medium)")
     ap.add_argument("-y", "--yes", action="store_true",
                     help="confirma automaticamente as ferramentas (sem perguntar)")
+    ap.add_argument("--save-code", action="store_true",
+                    help="salva blocos de código da resposta em arquivos "
+                         "automaticamente (sem perguntar)")
     ap.add_argument("--no-tools", action="store_true",
                     help="desativa as ferramentas nesta sessão")
     ap.add_argument("--temperature", type=float,
@@ -2998,10 +4187,17 @@ def main(argv=None):
             return 2
         print(c.yellow("⚠ " + str(e)))
 
+    # subagentes de exemplo + servidores MCP configurados
+    ensure_default_subagents()
+    if cfg.get("mcp_enabled", True):
+        mcp_start_all(c)
+
     tools_enabled = (cfg["mode"] in ("coding", "workflow")) and not args.no_tools
 
     # -y vale só para esta sessão (não vai para a config salva)
     sess.auto_confirm = bool(args.yes) or bool(cfg["auto_confirm"])
+    if args.save_code:
+        cfg["auto_save_code"] = True
 
     prompt = " ".join(args.prompt).strip()
     if not prompt and not sys.stdin.isatty():
