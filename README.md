@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.8.2 — assistente de IA no terminal (local ou na nuvem)
+⚡ SEND v1.12.0 — assistente de IA no terminal (local ou na nuvem)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -150,11 +150,11 @@ model                    # lista modelos do provider atual e permite escolher
 model gpt-5              # troca diretamente pelo ID
 ```
 
+> Se o provider já tem API key salva (`/provider nvidia` já configurado), o SEND mostra um menu: `1. Reescrever API key / 2. Excluir configuração / 3. Sair`.
+
 ### Paleta e autocomplete de comandos
 
-Digite `/` para abrir a paleta. Continue digitando para filtrar (`/p` sugere
-`/provider`; `/m` sugere `/model`), navegue com **↑/↓** e complete a seleção
-com **Tab** ou **Enter**. O Tab do prompt também completa nomes de comandos.
+Digite `/` e a **mini barra inline** aparece **abaixo do prompt** (tipo Claude Code) — continue digitando para filtrar (`/p` sugere `/provider`; `/m` sugere `/model`) sem sair da linha e sem apagar o histórico acima. Ela mostra até 6 sugestões por vez com `··· X abaixo/acima` e `✅` nos providers conectados, `↑/↓` navega, `Tab` completa, `Enter` seleciona. Subcomandos também funcionam: `/provider ` lista providers (`auto`, `openai`... com host e modelo), `/model ` lista modelos do provider atual (com cache), `/skills `, `/config `, `/team ` etc.
 `/help` exibe a lista completa com uma descrição breve de cada comando.
 
 ## 🔄 Backend automático: LM Studio **ou** Ollama
@@ -225,7 +225,7 @@ send --workflow -y "crie um app de tarefas em Python"   # sem perguntar
 ## 🧠 Memória de longo prazo (aprende sozinho)
 
 O SEND tem um arquivo de memória (`~/.send/memoria.md`) que **aprende com o
-tempo**:
+tempo** (limitada a ~2200 chars com poda automática e lembrete a cada 10 turnos):
 
 - Toda conversa começa com a memória resumida no contexto do modelo;
 - Quando o SEND descobre algo útil (suas preferências, decisões do projeto,
@@ -239,8 +239,8 @@ tempo**:
 ## 🧠 Resumo automático de conversas longas
 
 Modelos locais têm contexto limitado — por isso o SEND **resume sozinho**
-conversas longas (16+ mensagens): o trecho antigo vira um resumo que continua
-no contexto, sem perder as decisões importantes.
+conversas longas (16+ mensagens **ou** ~20k tokens, com poda proativa de tool results grandes): o trecho antigo vira um resumo que continua
+no contexto, sem perder as decisões importantes. Limite configurável com `compression_threshold_tokens`.
 
 ```
 /resumo         # resume a conversa agora (e mostra o resumo atual)
@@ -331,6 +331,17 @@ Você é um revisor experiente. Leia os arquivos, liste problemas numerados…
 > internet) e nunca perguntam antes de usá-las — só dê `run_command` a um
 > subagente se você confia nele.
 
+## 👥 Equipe de IAs — 2+ subagentes colaborando
+
+Use `team` para colocar 2+ IAs trabalhando **juntas em paralelo** e o SEND sintetiza o melhor de cada uma. Grátis por padrão (mesmo modelo local com papéis diferentes) ou modelos diferentes por agente (`nome@model` ou `nome:provider/model`):
+
+```
+/team revisor,pesquisador crie uma API de tarefas
+/team revisor@qwen2.5-coder-7b,pesquisador:openai/gpt-4o analise este código --estrategia debate
+```
+
+Estratégias: `paralelo` (padrão, todos juntos), `debate` (um propõe, outro critica) e `sequencial` (um após o outro vendo o anterior). Também funciona pedindo ao SEND: `"use a equipe revisor+pesquisador em paralelo"`.
+
 ## 🔌 MCP — ferramentas de servidores externos
 
 O SEND fala o **Model Context Protocol** (MCP) via stdio: você conecta
@@ -386,6 +397,21 @@ O SEND pode rodar comandos do seu sistema em eventos da sessão
 Variáveis disponíveis: `SEND_EVENT`, `SEND_TOOL`, `SEND_ARGS`,
 `SEND_RESULT`, `SEND_PROMPT`. Desligue com `/config hooks false`.
 
+## 🌿 Worktree isolado por sessão
+
+Cada sessão pode rodar em um `git worktree` separado para não colidir arquivos quando 2 agentes trabalham no mesmo repo:
+
+```
+/worktree on     # liga — cria worktree em ~/.send/worktrees/sess-... a partir do remote tip
+/worktree off    # desliga — volta ao diretório atual
+```
+
+Desligado por padrão (`worktree_sync` controla se branch vem do `origin/HEAD` ou do `HEAD` local).
+
+## 🛡️ Scan de segurança local
+
+Antes de executar comandos no terminal, o SEND escaneia localmente (sem API) `pipe-to-shell` (`curl | bash`), `rm -rf /` e homograph, e avisa. Desative com `/config security_scan false`.
+
 ## 🧰 Skills — o que o SEND sabe fazer
 
 O SEND tem **8 skills** que podem ser ligadas e desligadas individualmente
@@ -396,11 +422,11 @@ com `/skills`:
 | **arquivos** | Lê, escreve, **edita**, lista e **procura** arquivos no PC | `read_file`, `write_file`, `edit_file`, `list_files`, `find_files` |
 | **terminal** | Executa comandos no seu terminal | `run_command` |
 | **internet** | **Pesquisa na web** e lê o conteúdo de páginas | `web_search`, `fetch_url` |
-| **pc** | **Abre arquivos e links** no sistema e mostra **informações do PC** | `open_file`, `open_url`, `system_info` |
+| **pc** | **Abre arquivos e links** no sistema, **navega no browser** e mostra **informações do PC** | `open_file`, `open_url`, `browser_open`, `system_info` |
 | **git** | Opera repositórios git | `git_status`, `git_log`, `git_diff`, `git_commit` |
 | **processos** | Lista e encerra processos do sistema | `list_processes`, `kill_process` |
 | **memoria** | Aprende com o tempo e cria novas skills | `read_memory`, `remember`, `create_skill` |
-| **subagentes** | Delega tarefas a subagentes especializados e cria novos | `delegate`, `create_subagent` |
+| **subagentes** | Delega tarefas a subagentes, cria novos e monta **equipes de 2+ IAs** | `delegate`, `create_subagent`, `team` |
 
 ```bash
 /skills                      # lista as skills ativas (nativas + criadas)
@@ -510,6 +536,7 @@ send "mostre as informações do meu PC"          # skill pc
 send "procure o arquivo config.py"              # skill arquivos
 send "crie uma skill para revisar meu código"   # cria skill personalizada
 send "delegue a revisão do código ao subagente revisor"   # delega a um subagente
+send "/team revisor,pesquisador crie uma API de tarefas"  # equipe de 2+ IAs em paralelo
 send --models                           # lista os modelos do LM Studio
 send --doctor                           # diagnostica a instalação
 send --update                           # atualiza para a versão mais recente
@@ -530,8 +557,8 @@ autocompletar comandos.
 /code     /chat   /plan   /workflow   /tools on|off
 /automode [on|off]   /outmode [on|off]
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
-/backups [restore n]   /contexto [on|off]   /subagentes [nome] [tarefa]
-/mcp [nome|reload]   /hooks   /update   /doctor
+/backups [restore n]   /contexto [on|off]   /subagentes [nome] [tarefa]   /team <agentes> <tarefa>
+/worktree [on|off]   /mcp [nome|reload]   /hooks   /update   /doctor
 ```
 
 ---
