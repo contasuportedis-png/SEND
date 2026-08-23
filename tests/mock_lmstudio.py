@@ -154,4 +154,4 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print("Mock LM Studio em http://127.0.0.1:1234")
-    HTTPServer(("127.0.0.1", 1234), Handler).serve_forever()
+    HTTPServer(("127.0.0.1", int(__import__("os").environ.get("SEND_MOCK_PORT", "1234"))), Handler).serve_forever()

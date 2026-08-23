@@ -73,16 +73,17 @@ import send
 cfg = send.load_config()
 assert set(cfg["skills"]) == set(send.SKILL_ORDER), cfg["skills"]
 tools = send.TOOLS
-assert len(tools) == 22, len(tools)
-ALLOWED = {"read_file","write_file","edit_file","list_files","find_files",
-           "run_command","web_search","fetch_url","system_info","open_file",
-           "open_url","git_status","git_log","git_diff","git_commit",
-           "list_processes","kill_process","read_memory","remember",
-           "create_skill", "delegate", "create_subagent"}
+ALLOWED_ALL = {"read_file","write_file","edit_file","list_files","find_files",
+               "run_command","web_search","fetch_url","system_info","open_file",
+               "open_url","browser_open","git_status","git_log","git_diff","git_commit",
+               "list_processes","kill_process","read_memory","remember",
+               "create_skill","delegate","create_subagent","team"}
+for _t in tools:
+    assert _t["function"]["name"] in ALLOWED_ALL, _t["function"]["name"]
+print(f"   {len(tools)} ferramentas válidas OK")
 for t in tools:
-    assert t["function"]["name"] in ALLOWED, t["function"]["name"]
-    assert t["skill"] in send.SKILLS
-print("   22 ferramentas com skill OK")
+    assert t["skill"] in send.SKILLS, (t["function"]["name"], t.get("skill"))
+print("   todas as ferramentas com skill OK")
 PY
 
 echo "== 15. Filtro de skills no payload =="
@@ -210,8 +211,10 @@ for i in range(10):
     sess.messages.append({"role": "user", "content": f"pergunta {i}"})
     sess.messages.append({"role": "assistant", "content": f"resposta {i}"})
 assert len(sess.messages) == 20
-ok = send.summarize_conversation(sess, c)
-assert ok and len(sess.messages) == 6 and sess.summary
+from unittest.mock import patch as _patch
+with _patch.object(send, "ask_model", side_effect=lambda s,t,c_,a: "resumo fake determinístico"):
+    ok = send.summarize_conversation(sess, c)
+assert ok and len(sess.messages) == 6 and sess.summary == "resumo fake determinístico"
 print("   auto-resumo OK")
 PY
 

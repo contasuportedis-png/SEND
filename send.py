@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.12.0"
+VERSION = "1.14.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -152,6 +152,34 @@ CONFIG_PATH = SEND_HOME / "config.json"
 HISTORY_PATH = SEND_HOME / "history.jsonl"
 INPUT_HISTORY = SEND_HOME / "input_history"
 
+def _read_utf8_event(fd, maxlen=16):
+    """Lê UM evento de tecla juntando bytes até formar UTF-8 válido (grátis).
+
+    Corrige a perda de acentos/emojis: 'ç' chega como 0xC3 0xA7 e ler 1 byte
+    por vez com errors='ignore' descartava o caractere inteiro.
+    """
+    buf = os.read(fd, 1)
+    if not buf:
+        return ""
+    for _ in range(6):
+        try:
+            return buf.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        # pode ser multibyte incompleto: espera o resto rapidinho
+        import select as _sel
+        if not _sel.select([fd], [], [], 0.05)[0]:
+            break
+        try:
+            nb = os.read(fd, 1)
+        except OSError:
+            break
+        if not nb:
+            break
+        buf += nb
+    return buf.decode("utf-8", "ignore")
+
+
 MAX_TOOL_ROUNDS = 12
 RUN_TIMEOUT = 120
 TOOL_OUTPUT_LIMIT = 4000
@@ -175,6 +203,8 @@ class C:
     def yellow(self, s):  return self._w("33", s)
     def cyan(self, s):    return self._w("36", s)
     def magenta(self, s): return self._w("35", s)
+    def white(self, s):   return self._w("97", s)
+    def blue(self, s):    return self._w("94", s)
 
 
 def make_colors():
@@ -195,6 +225,34 @@ def make_colors():
 # ---------------------------------------------------------------------------
 
 import threading
+
+
+# Tema central (grátis): cores fixas por papel — consistência visual
+THEME = {
+    "accent":   "cyan",     # destaque principal
+    "mode":     {"CODING": "cyan", "CHAT": "blue", "PLAN": "magenta",
+                 "WORKFLOW": "magenta", "AUTO": "yellow"},
+    "ok":       "green",
+    "warn":     "yellow",
+    "err":      "red",
+    "dim":      "dim",
+}
+
+def c_bold_chip(s):
+    """Chip [lang] em bold mantendo a cor base do texto recebido."""
+    return "\x1b[1m" + s + "\x1b[0m"
+
+
+_LANG_CHIP = {
+    "python":"cyan","py":"cyan","javascript":"yellow","js":"yellow",
+    "typescript":"yellow","ts":"yellow","bash":"green","sh":"green",
+    "shell":"green","json":"cyan","html":"orange" if False else "magenta",
+    "css":"magenta","sql":"green","rust":"red","go":"cyan","c":"white",
+}
+
+
+def _lang_chip_color(lang):
+    return _LANG_CHIP.get((lang or "").lower(), "white")
 
 
 def _rgb(r, g, b):
@@ -237,12 +295,16 @@ def banner(c, model=None, mode=None):
             print(_rgb(r, g, b) + line + "\033[0m")
     else:
         print(SEND_ART[0])
-    info = f"v{VERSION}"
+    def _chip(s, col):
+        fn = getattr(c, col)
+        return c.dim("[") + fn(s) + c.dim("]")
+    chips = [_chip("v" + VERSION, "cyan")]
     if model:
-        info += f"  ·  modelo: {model}"
+        chips.append(_chip(str(model).rsplit("/", 1)[-1][:24], "green"))
     if mode:
-        info += f"  ·  modo: {mode}"
-    print(c.dim("  " + info))
+        icon, col = PROMPT_MODE_STYLE.get(str(mode).upper(), ("▸", "white"))
+        chips.append(_chip(icon + " " + str(mode).lower(), col))
+    print("  " + " ".join(chips))
     print(c.dim("  digite / para a paleta de comandos · /help · Ctrl+C para sair"))
     print()
 
@@ -264,9 +326,18 @@ def panel(title, body, c, color="cyan", width=66):
 
 
 def hr(c, ch="─", n=56, color="dim"):
-    """Linha divisória."""
-    fn = getattr(c, color)
-    print(fn(ch * n))
+    """Divisor leve: gradiente de pontos entre respostas; linha cheia em logs."""
+    if ch != "─" or not c.enabled:
+        fn = getattr(c, color)
+        print(fn(ch * n))
+        return
+    dots = ["·"] * 14
+    parts = []
+    for i, d in enumerate(dots):
+        tt = i / max(1, len(dots) - 1)
+        r = int(45 + (255 - 45) * tt); g = int(212 + (90 - 212) * tt); b = int(255 + (255 - 255) * tt)
+        parts.append(_rgb(r, g, b) + d)
+    print("  " + "".join(parts) + "\033[0m")
 
 
 def small(title, body, c, color="cyan"):
@@ -294,10 +365,14 @@ class Spinner:
         self._stop = False
 
         def run():
+            import time as _t_sp
+            start = _t_sp.time()
             i = 0
             while not self._stop:
                 f = self.FRAMES[i % len(self.FRAMES)]
-                sys.stdout.write("\r" + self.c.cyan(f) + " " + self.msg)
+                el = int(_t_sp.time() - start)
+                msg = self.msg if el < 5 else f"{self.msg} {el}s"
+                sys.stdout.write("\r" + self.c.cyan(f) + " " + msg)
                 sys.stdout.flush()
                 i += 1
                 time.sleep(0.08)
@@ -316,10 +391,15 @@ class Spinner:
 
 
 def _inline_md(text, c):
-    """Aplica cores a **negrito** e `código` em uma linha de texto."""
+    """Aplica cores a **negrito**, `código` (fundo sutil) e links."""
     text = re.sub(r"\*\*(.+?)\*\*", lambda m: c.bold(m.group(1)), text)
-    text = re.sub(r"`([^`]+)`", lambda m: c.yellow(m.group(1)), text)
-    text = re.sub(r"^#{1,6}\s*(.+)$", lambda m: c.bold(c.cyan(m.group(1))), text)
+    if c.enabled:
+        # código inline: fundo escuro + texto claro (estilo Claude Code)
+        text = re.sub(r"`([^`]+)`",
+                      lambda m: "\x1b[48;5;236m\x1b[96m " + m.group(1) + " \x1b[0m",
+                      text)
+    else:
+        text = re.sub(r"`([^`]+)`", lambda m: c.yellow(m.group(1)), text)
     return text
 
 
@@ -347,25 +427,44 @@ class MarkdownPrinter:
 
     def _emit(self, line):
         if not self.c.enabled:
+            # sem cor: mantém as marcas markdown originais (legível em log)
+            if self.in_code:
+                self.out.write("│ " + line + "\n")
+                return
             self.out.write(line + "\n")
             return
         stripped = line.strip()
         if stripped.startswith("```"):
             if self.in_code:
                 self.in_code = False
-                self.out.write(self.c.dim("└" + "─" * 42) + "\n")
+                self.out.write(self.c.dim("╰" + "─" * 44 + "╯") + "\n")
             else:
-                lang = re.match(r"```([\w+\-]*)", stripped)
-                lang = (lang.group(1) if lang and lang.group(1) else "código")
-                self.out.write(self.c.dim(f"┌─ {lang} " + "─" * max(2, 38 - len(lang))) + "\n")
+                m = re.match(r"```([\w+\-]*)", stripped)
+                lang = (m.group(1) if m and m.group(1) else "código")
+                col = getattr(self.c, _lang_chip_color(lang))
+                chip = col(f"[{lang}]")
+                self.out.write(self.c.dim("╭─ ") + c_bold_chip(chip) +
+                               self.c.dim(" " + "─" * max(2, 36 - len(lang))) + "\n")
                 self.in_code = True
             return
         if self.in_code:
-            self.out.write(self.c.green(line) + "\n")
+            self.out.write(self.c.dim("▎ ") + self.c.green(line) + "\n")
             return
-        if line.startswith("#"):
-            self.out.write(self.c.bold(self.c.cyan(line)) + "\n")
+        mh = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if mh:
+            level = len(mh.group(1))
+            txt = mh.group(2).strip()
+            if level == 1:
+                self.out.write("\n" if not getattr(self, "_after_h", False) else "")
+                self.out.write(self.c.bold(self.c.cyan("▐ ")) +
+                               self.c.bold(txt.upper()) + "\n")
+            elif level == 2:
+                self.out.write(self.c.magenta("▎ ") + self.c.bold(txt) + "\n")
+            else:
+                self.out.write(self.c.white("  ") + self.c.bold(txt) + "\n")
+            self._after_h = True
             return
+        self._after_h = False
         if stripped.startswith(("- ", "* ", "+ ", "• ")):
             self.out.write(self.c.cyan("  • ") + _inline_md(line[2:], self.c) + "\n")
             return
@@ -601,6 +700,15 @@ DEFAULT_CONFIG = {
     # Worktree isolado (grátis, local) — cada sessão pode ter seu worktree
     "worktree": False,             # True = cria worktree isolado por sessão
     "worktree_sync": True,         # True = branch do remote tip, False = do HEAD local
+    "prompt_cache_ttl": "5m",      # 5m ou 1h (informativo; reuso local do prefixo)
+    "api_max_retries": 3,          # tentativas extras em 429/5xx/rede (backoff curto)
+    "model_by_mode": {},           # ex.: {"codigo":"qwen2.5-coder-7b","chat":"gemma-3-4b"}
+    "command_deny": [],            # regex que BLOQUEIA run_command sempre
+    "command_allow": [],           # se não-vazio, SÓ estes passam (deny ganha)
+    "use_keyring": False,          # guarda api_key no keyring do sistema (se houver)
+    "skills_external_dirs": [],    # ex.: ["~/.agents/skills"] — lidas sem copiar
+    "security_scan": True,         # scan local antes de executar comandos
+    "browser_timeout": 120,        # timeout padrão do browser_open (s)
 }
 
 # Backups automáticos antes de editar/escrever arquivos
@@ -637,6 +745,45 @@ HOOKS_PATH = SEND_HOME / "hooks.json"
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 "
               "Firefox/126.0")
+
+_KEYRING_SERVICE = "send-cli"
+
+def _keyring_available():
+    try:
+        import keyring  # noqa
+        return True
+    except Exception:
+        return False
+
+def _keyring_set(provider_id, api_key):
+    """Guarda a chave no keyring do sistema (opcional). True se guardou."""
+    if not _keyring_available():
+        return False
+    try:
+        import keyring
+        keyring.set_password(_KEYRING_SERVICE, "provider:" + provider_id, api_key)
+        return True
+    except Exception:
+        return False
+
+def _keyring_get(provider_id):
+    if not _keyring_available():
+        return ""
+    try:
+        import keyring
+        return keyring.get_password(_KEYRING_SERVICE, "provider:" + provider_id) or ""
+    except Exception:
+        return ""
+
+def _keyring_delete(provider_id):
+    if not _keyring_available():
+        return False
+    try:
+        import keyring
+        keyring.delete_password(_KEYRING_SERVICE, "provider:" + provider_id)
+        return True
+    except Exception:
+        return False
 
 # Endpoint de busca (padrão: DuckDuckGo, sem chave de API).
 # Pode ser trocado com a variável SEND_SEARCH_URL (útil para testes).
@@ -684,10 +831,12 @@ def remember_entry(content):
         entry = f"\n## {ts}\n- {content.strip()}\n"
         with open(MEMORY_PATH, "a", encoding="utf-8") as f:
             f.write(entry)
-        # Pruning grátis: se exceder limite, mantém 80% mais recente
+        # Pruning grátis: se exceder limite (do config), mantém 80% mais recente
         try:
-            limit = 2200
-            # lê limite do config se possível (usa DEFAULT_CONFIG como fallback)
+            try:
+                limit = int(load_config().get("memory_char_limit", 2200))
+            except Exception:
+                limit = 2200
             text = MEMORY_PATH.read_text(encoding="utf-8")
             if len(text) > limit:
                 # mantém cabeçalho se houver e últimos 80%
@@ -730,7 +879,8 @@ def load_custom_skills():
     out = []
     try:
         if not SKILLS_DIR.exists():
-            return out
+            # não retorna cedo: cria vazia e segue para ler skills_external_dirs
+            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
         for f in sorted(SKILLS_DIR.glob("*.md")):
             try:
                 text = f.read_text(encoding="utf-8")
@@ -744,8 +894,33 @@ def load_custom_skills():
             out.append({"name": name, "description": desc, "instructions": text})
     except Exception:
         pass
+    # Skills externas (grátis): lê dirs extras sem copiar; locais têm precedência
+    try:
+        for ed in (load_config().get("skills_external_dirs") or []):
+            ep = Path(str(ed)).expanduser()
+            if not ep.is_dir():
+                continue
+            for f in sorted(ep.glob("*.md")):
+                nm = f.stem.strip().lower()
+                if not nm or any(s["name"] == nm for s in out):
+                    continue
+                try:
+                    tx = f.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                m2 = re.search(r"(?im)^\s*descri(?:ção|cao)\s*:\s*(.+)$", tx)
+                d2 = m2.group(1).strip() if m2 else "(externa)"
+                mt2 = re.search(r"(?im)^\s*ferramentas?\s*:\s*(.+)$", tx)
+                tl2 = None
+                if mt2:
+                    rw = mt2.group(1).strip().lower()
+                    tl2 = [] if rw in ("nenhuma", "nenhum", "sem", "chat") else \
+                        [x.strip() for x in re.split(r"[,;]", rw) if x.strip()]
+                out.append({"name": nm, "description": d2, "tools": tl2,
+                            "instructions": tx})
+    except Exception:
+        pass
     return out
-
 
 def custom_skill_tool(cs):
     """Converte uma skill personalizada em uma ferramenta para a API."""
@@ -1600,6 +1775,15 @@ def _worktree_create(c):
             r2 = subprocess.run(["git", "worktree", "add", str(wt_path), base_ref], capture_output=True, text=True, timeout=15)
             if r2.returncode != 0:
                 return None
+        try:
+            import json as _json_w
+            top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                 capture_output=True, text=True, timeout=5).stdout.strip()
+            (SEND_HOME / "worktrees").mkdir(parents=True, exist_ok=True)
+            (SEND_HOME / "worktrees" / (f"sess-{ts}" + ".json")).write_text(
+                _json_w.dumps({"repo": top}), encoding="utf-8")
+        except Exception:
+            pass
         print(c.dim(f"  🌿 worktree isolado: {wt_path} (de {base_ref})"))
         return wt_path
     except Exception as e:
@@ -1610,11 +1794,35 @@ def _worktree_create(c):
         return None
 
 def _worktree_remove(wt_path, c):
+    """Remove o worktree da sessão e o branch send/<ts> criado junto (sem lixo)."""
     try:
         import subprocess
-        if wt_path and wt_path.exists():
-            subprocess.run(["git", "worktree", "remove", "--force", str(wt_path)], capture_output=True, timeout=10)
-            print(c.dim(f"  🧹 worktree removido: {wt_path}"))
+        if not wt_path:
+            return
+        meta = SEND_HOME / "worktrees" / (wt_path.name + ".json")
+        repo = None
+        try:
+            if meta.exists():
+                import json as _json
+                repo = _json.loads(meta.read_text(encoding="utf-8")).get("repo")
+        except Exception:
+            repo = None
+        if wt_path.exists():
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt_path)],
+                           capture_output=True, timeout=10)
+        # apaga o branch criado por esta sessão (send/<ts>)
+        ts = wt_path.name.replace("sess-", "", 1)
+        branch = "send/" + ts
+        cmd = ["git"]
+        if repo:
+            cmd += ["-C", repo]
+        subprocess.run(cmd + ["branch", "-D", branch],
+                       capture_output=True, timeout=10)
+        try:
+            meta.unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(c.dim(f"  🧹 worktree removido: {wt_path} (branch {branch} limpo)"))
     except Exception:
         pass
 
@@ -1682,6 +1890,12 @@ def provider_api_key(cfg, spec=None):
     spec = spec or provider_spec(cfg)
     env_name = spec.get("env_key", "")
     saved = spec.get("api_key", "")
+    # valor-sentinel: chave mora no keyring do sistema, não no json
+    if saved == "__keyring__":
+        kr = _keyring_get(spec.get("id") or cfg.get("provider", ""))
+        if kr:
+            return kr
+        return os.environ.get("SEND_API_KEY", "")
     # O campo legado só pertence ao provider que está ativo. Nunca o reutilize
     # ao trocar (por exemplo, não envie uma chave OpenAI para a Anthropic).
     legacy = cfg.get("api_key", "") if spec.get("id") == cfg.get("provider") else ""
@@ -1779,7 +1993,11 @@ def configure_provider(cfg, provider_id, c, input_fn=input):
             except (EOFError, KeyboardInterrupt):
                 key = ""
             if key:
-                providers.setdefault(provider_id, {})["api_key"] = key
+                if cfg.get("use_keyring") and _keyring_set(provider_id, key):
+                    providers.setdefault(provider_id, {})["api_key"] = "__keyring__"
+                    print(c.dim("  🔐 chave guardada no keyring do sistema."))
+                else:
+                    providers.setdefault(provider_id, {})["api_key"] = key
     activate_provider(cfg, provider_id)
     cfg["setup_complete"] = True
     save_config(cfg)
@@ -1817,7 +2035,18 @@ def first_run_setup(cfg, c):
     return bool(selected)
 
 
+_CFG_CACHE = {"path": None, "mtime": None, "data": None}
+
 def load_config():
+    global _CFG_CACHE
+    try:
+        mt = CONFIG_PATH.stat().st_mtime
+    except Exception:
+        mt = None
+    if (_CFG_CACHE["path"] == str(CONFIG_PATH)
+            and _CFG_CACHE["mtime"] == mt and _CFG_CACHE["data"] is not None):
+        import copy as _copy
+        return _copy.deepcopy(_CFG_CACHE["data"])
     cfg = dict(DEFAULT_CONFIG)
     cfg["providers"] = {}
     data = {}
@@ -1839,15 +2068,30 @@ def load_config():
         cfg["base_url"] = os.environ["SEND_BASE_URL"].rstrip("/")
     if os.environ.get("SEND_MODEL"):
         cfg["model"] = os.environ["SEND_MODEL"]
+    if os.environ.get("SEND_API_KEY"):
+        cfg["api_key"] = os.environ["SEND_API_KEY"]
+    try:
+        import copy as _copy2
+        _CFG_CACHE["path"] = str(CONFIG_PATH)
+        _CFG_CACHE["mtime"] = mt
+        _CFG_CACHE["data"] = _copy2.deepcopy(cfg)
+    except Exception:
+        pass
     return cfg
 
 
 def save_config(cfg):
+    global _CFG_CACHE
     try:
+        _CFG_CACHE = {"path": None, "mtime": None, "data": None}
         SEND_HOME.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(
             json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        try:
+            os.chmod(CONFIG_PATH, 0o600)   # contém api_keys — só o dono lê
+        except Exception:
+            pass
     except Exception as e:
         print(f"⚠ não foi possível salvar a configuração: {e}")
 
@@ -2616,6 +2860,24 @@ TOOLS = [
         },
         "skill": "subagentes",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_open",
+            "description": "Abre uma URL no navegador do sistema E devolve o texto "
+                           "principal da página (timeout configurável). Use para "
+                           "consultar documentação, artigos e páginas web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL completa (http/https)."},
+                    "timeout": {"type": "number", "description": "Timeout em segundos (padrão: browser_timeout)."},
+                },
+                "required": ["url"],
+            },
+        },
+        "skill": "pc",
+    },
 ]
 
 def ask_yes_no(c, question, default=False):
@@ -2683,13 +2945,49 @@ def tool_list(args, c):
     return "\n".join(lines) if lines else "(diretório vazio)"
 
 
-def tool_run(args, c):
+_SECURITY_PATTERNS = [
+    # (regex, descrição do risco)
+    (re.compile(r"(curl|wget)\s+[^|]*\|\s*(ba|z|da|k)?sh\b", re.I),
+     "pipe-to-shell (baixa da internet executada direto)"),
+    (re.compile(r"rm\s+-rf\s+/(?:\s|$|\*)"), "rm -rf / destrutivo"),
+    (re.compile(r"[\u0400-\u04FF]"), "possível homograph (caracteres cirílicos)"),
+]
+
+
+def _security_scan(cmd):
+    """Scan local grátis (estilo tirith): retorna lista de riscos do comando."""
+    issues = []
+    for rx, desc in _SECURITY_PATTERNS:
+        if rx.search(cmd or ""):
+            issues.append(desc)
+    return issues
+
+
+def tool_run(args, c, cfg=None):
     cmd = args.get("command", "")
     try:
         timeout = int(args.get("timeout") or RUN_TIMEOUT)
     except (TypeError, ValueError):
         timeout = RUN_TIMEOUT
     timeout = max(1, min(timeout, RUN_TIMEOUT))
+    # Política de comandos (grátis): deny sempre bloqueia; allow = só os listados
+    if cfg is not None:
+        try:
+            import re as _re_pol
+            deny = [d for d in (cfg.get("command_deny") or []) if d]
+            allow = [a for a in (cfg.get("command_allow") or []) if a]
+            denied = any(_re_pol.fullmatch(d, cmd) for d in deny)
+            not_allowed = bool(allow) and not any(_re_pol.fullmatch(a, cmd) for a in allow)
+            if denied or not_allowed:
+                why = "bloqueado por command_deny" if denied else "fora de command_allow"
+                print(c.red(f"    ⛔ {why}: {cmd[:80]}"))
+                return f"Bloqueado pela política de comandos ({why}). Peça ao usuário ajustar /config command_deny ou command_allow."
+        except Exception:
+            pass
+    if cfg and cfg.get("security_scan", True):
+        risks = _security_scan(cmd)
+        for rdesc in risks:
+            print(c.yellow(f"    ⚠ segurança: {rdesc}"))
     print(c.dim(f"    $ {cmd}"))
     try:
         proc = subprocess.run(
@@ -2727,13 +3025,15 @@ def _dispatch_tool(name, args, c, auto_confirm, cfg=None):
             preview = args.get("command", "")[:80]
             if not ask_yes_no(c, f"Executar comando: {preview}…"):
                 return None
-        return tool_run(args, c)
+        return tool_run(args, c, cfg)
     if name == "web_search":
         return tool_web_search(args, c)
     if name == "fetch_url":
         return tool_fetch_url(args, c)
     if name == "system_info":
         return tool_system_info(args, c)
+    if name == "browser_open":
+        return tool_browser_open(args, c)
     if name == "open_file":
         return tool_open_file(args, c)
     if name == "open_url":
@@ -3034,6 +3334,35 @@ def tool_open_url(args, c):
         return f"✅ Navegador aberto: {url}"
     except Exception as e:
         return f"Erro ao abrir o navegador: {e}"
+
+
+def tool_browser_open(args, c):
+    """Abre a URL no navegador do sistema e devolve o texto principal (grátis)."""
+    url = _safe_url(args.get("url", "").strip())
+    if not url:
+        return "Erro: url vazia."
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+    try:
+        timeout = int(args.get("timeout") or 120)
+    except (TypeError, ValueError):
+        timeout = 120
+    timeout = max(5, min(timeout, 300))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=min(timeout, 30)) as resp:
+            data = resp.read(300 * 1024)
+            ctype = resp.headers.get("Content-Type", "")
+        if "text" not in ctype and "html" not in ctype:
+            return f"✅ Aberto: {url} (tipo {ctype or '?'}, {len(data)} bytes — não é texto)"
+        text = _TextExtractor().feed_and_text(data.decode("utf-8", errors="replace"))
+        if len(text) > TOOL_OUTPUT_LIMIT:
+            text = text[:TOOL_OUTPUT_LIMIT] + "\n… (texto truncado)"
+        return f"✅ Aberto: {url}\n\n{text or '(página sem texto legível)'}"
+    except Exception as e:
+        return f"✅ Aberto: {url} (falha ao ler conteúdo: {e})"
 
 
 # --- Skill: git -------------------------------------------------------------
@@ -3345,7 +3674,10 @@ def summarize_conversation(sess, c):
                     "preferências, arquivos citados e pendências):\n\n" + text),
     }]
     try:
-        summary = ask_model(sub, False, c, True) or ""
+        import io as _io_s, contextlib as _cl_s
+        _sink = _io_s.StringIO()
+        with _cl_s.redirect_stdout(_sink):
+            summary = ask_model(sub, False, c, True) or ""
     except Exception:
         return False
     summary = summary.strip()
@@ -3413,9 +3745,83 @@ def _anthropic_payload(payload):
     return converted
 
 
+_MODE_GROUPS = {
+    "chat": "chat",
+    "coding": "codigo",
+    "plan": "plano",
+    "workflow_plan": "plano",
+    "workflow_build": "codigo",
+    "workflow_verify": "codigo",
+    "workflow_fix": "codigo",
+    "workflow": "codigo",
+}
+
+def _mode_model(cfg):
+    """Modelo escolhido por modo (model_by_mode) — grátis, decide sozinho.
+
+    Prioridade: pensamento (se thinking on) > modo atual > None (usa o global).
+    """
+    mbm = cfg.get("model_by_mode")
+    if not isinstance(mbm, dict):
+        return None
+    try:
+        if cfg.get("thinking"):
+            m = mbm.get("pensamento") or mbm.get("thinking")
+            if m:
+                return m
+    except Exception:
+        pass
+    g = _MODE_GROUPS.get(cfg.get("mode", "coding"), "codigo")
+    return mbm.get(g)
+
+
+_RETRYABLE = {429, 500, 502, 503, 504}
+
+def _open_stream_retry(url, payload_fn, api_key, c, attempts=3):
+    """Abre o stream SSE com retry/backoff curto em 429/5xx/rede (grátis).
+
+    stream_sse é generator lazy: o urlopen só roda na primeira iteração.
+    Aqui PRIMAMOS o gerador (next) para que erros de conexão/HTTP aconteçam
+    DENTRO do retry; depois encadeamos o resto via itertools.chain.
+    """
+    import itertools as _it
+    last = None
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            delay = 0.5 * (2 ** (attempt - 1))
+            print(c.yellow(f"  ↻ tentativa {attempt+1}/{attempts} em {delay:.0f}s…"))
+            time.sleep(delay)
+        gen = None
+        try:
+            gen = stream_sse(url, payload_fn(), api_key)
+            first = next(gen)          # dispara a conexão AGORA (dentro do try)
+            return _it.chain([first], gen)
+        except urllib.error.HTTPError as e:
+            if e.code in _RETRYABLE:
+                last = e
+                continue
+            raise
+        except urllib.error.URLError as e:
+            last = e
+            continue
+        except OSError as e:
+            last = e
+            continue
+        except StopIteration:
+            # stream vazio é válido: devolve chain vazio
+            return _it.chain([])
+    if isinstance(last, Exception):
+        raise last
+    raise ConnectionError("não consegui abrir o stream")
+
+
 def call_model(sess, tools_enabled, c, cfg):
     """Chama a API com streaming. Retorna (conteúdo, tool_calls, reasoning)."""
-    if sess.model_id is None:
+    # Modelo por modo (grátis): troca sozinho conforme /chat /code /plan /thinking
+    want = _mode_model(cfg)
+    if want:
+        sess.model_id = want
+    elif sess.model_id is None:
         sess.model_id = resolve_model(cfg, c)
     extra = getattr(sess, "extra_system", "")
     summary = getattr(sess, "summary", None)
@@ -3447,8 +3853,10 @@ def call_model(sess, tools_enabled, c, cfg):
     request_payload = _anthropic_payload(payload) if api_format == "anthropic" else payload
     endpoint = "messages" if api_format == "anthropic" else "chat/completions"
     try:
-        stream = stream_sse(provider_api_url(cfg, endpoint), request_payload,
-                            provider_api_key(cfg))
+        def _pl(): return request_payload
+        stream = _open_stream_retry(provider_api_url(cfg, endpoint), _pl,
+                                    provider_api_key(cfg), c,
+                                    max(1, int(cfg.get("api_max_retries", 3))))
         return _consume_stream(stream, c, cfg)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -3463,8 +3871,10 @@ def call_model(sess, tools_enabled, c, cfg):
             payload.pop("reasoning_effort", None)
             request_payload = (_anthropic_payload(payload)
                                if api_format == "anthropic" else payload)
-            stream = stream_sse(provider_api_url(cfg, endpoint),
-                                request_payload, provider_api_key(cfg))
+            def _pl2(): return request_payload
+            stream = _open_stream_retry(provider_api_url(cfg, endpoint), _pl2,
+                                        provider_api_key(cfg), c,
+                                        max(1, int(cfg.get("api_max_retries", 3))))
             return _consume_stream(stream, c, cfg)
         raise
 
@@ -3566,11 +3976,17 @@ def _consume_stream(stream, c, cfg):
 
 
 def _guard_is_failure(result):
-    """Heurística local (grátis): detecta falha sem chamar API."""
+    """Heurística local (grátis): só considera falha se o RESULTADO COMEÇA com
+    indicador de erro (evita falso positivo quando o conteúdo legítimo contém
+    a palavra 'erro' no meio, ex.: ler um arquivo que trata erros)."""
     if not result:
         return False
-    low = result.lower()
-    return any(k in low for k in ("erro", "falhou", "falha", "não encontrada", "not found", "exception", "traceback"))
+    low = str(result).lstrip().lower()
+    prefixes = ("erro", "error", "falha", "falhou", "não encontrado",
+                "nao encontrado", "not found", "exception", "traceback")
+    if low.startswith(prefixes):
+        return True
+    return "traceback (most recent call last)" in low
 
 def _guard_check(sess, name, args, result, history, c):
     """Verifica loops; retorna (warn_msg ou None, should_hard_stop bool)."""
@@ -3656,6 +4072,7 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
                 args = {"_raw": raw}
             print(c.cyan("  ╭─ ") + tool_icon(name) + " " +
                   c.bold(name) + c.dim(" " + compact_args(args)))
+            _t_tool = time.time()
             result = execute_tool(name, args, c, auto_confirm, sess.cfg)
             if result is None:
                 result = (
@@ -3677,8 +4094,13 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
                 _guard_history.append({"name": name, "args": args, "result": result})
                 break
             _guard_history.append({"name": name, "args": args, "result": result})
-            prev = result.split("\n")[0][:110]
-            print(c.dim("  ╰─ " + (prev or "(sem saída)")))
+            prev = result.split("\n")[0][:100]
+            dt_tool = time.time() - _t_tool
+            if cfg.get("guardrails_warnings", True) and _guard_is_failure(result):
+                status = c.yellow(f"⚠ {dt_tool:.1f}s")
+            else:
+                status = c.green(f"✓ {dt_tool:.1f}s")
+            print(c.dim("  ╰─ ") + status + c.dim("  " + (prev or "(sem saída)")))
             sess.messages.append(
                 {"role": "tool", "tool_call_id": tc["id"] or f"call_{len(sess.messages)}",
                  "content": result}
@@ -3811,7 +4233,11 @@ def run_workflow(sess, task, c, cfg):
 
     # ---- 1. PLANEJAR ----
     print()
-    panel("📋 ETAPA 1/4 — PLANEJAR", "Separando a tarefa em etapas…", c)
+    def _wf_bar(step):
+        filled = "▰" * step + "▱" * (4 - step)
+        return c.dim(f"[{filled}] {step}/4")
+    panel("📋 ETAPA 1/4 — PLANEJAR  " + _wf_bar(1),
+          "Separando a tarefa em etapas…", c)
     with Spinner(c, "planejando…"):
         plan_sess = Session(cfg, c)
         cfg["mode"] = "workflow_plan"
@@ -3838,7 +4264,8 @@ def run_workflow(sess, task, c, cfg):
 
     # ---- 2. CONSTRUIR ----
     print()
-    panel("🔨 ETAPA 2/4 — CONSTRUIR", "Executando o plano passo a passo…", c)
+    panel("🔨 ETAPA 2/4 — CONSTRUIR  " + _wf_bar(2),
+          "Executando o plano passo a passo…", c)
     build_sess = Session(cfg, c)
     build_sess.messages = [
         {"role": "user", "content": task},
@@ -3862,7 +4289,7 @@ def run_workflow(sess, task, c, cfg):
     report = ""
     for cycle in range(1, WORKFLOW_MAX_FIX_CYCLES + 1):
         print()
-        panel("✅ ETAPA 3/4 — VERIFICAR",
+        panel("✅ ETAPA 3/4 — VERIFICAR  " + _wf_bar(3),
               f"Conferindo o que foi construído (ciclo {cycle})…", c, color="green")
         ctx = (f"{task}\n\nO que foi construído até agora:\n"
                f"{build_summary[:3000]}\n")
@@ -3891,7 +4318,7 @@ def run_workflow(sess, task, c, cfg):
             break
         # precisa corrigir
         print()
-        panel(f"🔧 ETAPA 4/4 — CORRIGIR",
+        panel("🔧 ETAPA 4/4 — CORRIGIR  " + _wf_bar(4),
               f"Ciclo de correção {cycle}/{WORKFLOW_MAX_FIX_CYCLES}…", c,
               color="yellow")
         f_sess = Session(cfg, c)
@@ -3995,6 +4422,7 @@ COMMANDS = [
     ("/exit", "/exit", "Sai do SEND", "básico"),
     ("/provider", "/provider [nome|add]", "Adiciona ou troca o provider de IA", "modelo"),
     ("/model", "/model [nome]", "Lista ou troca o modelo do provider atual", "modelo"),
+    ("/agentes", "/agentes [modo] [modelo|auto]", "Modelo por modo: codigo/chat/plano/pensamento — o SEND troca sozinho", "modelo"),
     ("/models", "/models", "Lista os modelos do provider atual", "modelo"),
     ("/thinking", "/thinking [on|off]", "Liga/desliga o pensamento do modelo", "modelo"),
     ("/backend", "/backend [lmstudio|ollama|url]", "Mostra ou troca o servidor (LM Studio / Ollama)", "modelo"),
@@ -4232,13 +4660,18 @@ def show_command_menu(c, initial_query=""):
         sys.stdout.write("\r\n".join(lines) + "\r\n")
         sys.stdout.flush()
         drawn = len(lines) + 1
+        key_q2 = ""
         while True:
             try:
-                ch = os.read(fd, 1).decode(errors="ignore")
+                ev2 = _read_utf8_event(fd)
             except OSError:
-                ch = ""
-            if not ch:
+                ev2 = ""
+            if ev2:
+                key_q2 += ev2
+            if not key_q2:
                 continue
+            ch = key_q2[0]
+            key_q2 = key_q2[1:]
             if ch in ("q", "Q", "\x03"):
                 break
             if ch in ("\r", "\t"):
@@ -4321,7 +4754,28 @@ EDITABLE_CONFIG = {
     "auto_confirm": bool, "auto_backend": bool, "project_context": bool,
     "auto_summarize": bool, "mode": str, "mcp_enabled": bool, "hooks": bool,
     "auto_mode": bool, "outmode": bool,
+    "guardrails_warnings": bool, "guardrails_hard_stop": bool,
+    "memory_char_limit": int, "memory_nudge_interval": int,
+    "compression_threshold_tokens": int, "compression_proactive_prune": bool,
+    "worktree": bool, "worktree_sync": bool,
+    "prompt_cache_ttl": str, "security_scan": bool,
+    "browser_timeout": int, "auto_save_code": bool,
+    "skills_external_dirs": list,
+    "api_max_retries": int, "use_keyring": bool,
+    "command_deny": list, "command_allow": list,
 }
+
+
+def _parse_config_list(raw):
+    """Aceita JSON ('["a","b"]') ou itens separados por vírgula."""
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            v = json.loads(s)
+            return list(v) if isinstance(v, list) else s
+        except Exception:
+            pass
+    return [x.strip() for x in s.split(",") if x.strip()]
 
 
 def _parse_config_value(key, raw):
@@ -4330,6 +4784,10 @@ def _parse_config_value(key, raw):
         return raw.lower() in ("true", "1", "sim", "yes", "on")
     if t is float:
         return float(raw)
+    if t is int:
+        return int(float(raw))
+    if t is list:
+        return _parse_config_list(raw)
     return raw
 
 
@@ -4460,7 +4918,9 @@ def cmd_provider(sess, rest, c, tools_enabled):
         print(c.cyan(f"● Provider '{arg}' já configurado."))
         # verifica se tem api_key para mostrar
         existing = configured.get(arg, {}).get("api_key", "") if isinstance(configured.get(arg), dict) else ""
-        if existing:
+        if existing == "__keyring__":
+            print(c.dim("  API key atual: 🔐 (guardada no keyring do sistema)"))
+        elif existing:
             masked = existing[:4] + "…" + existing[-4:] if len(existing) > 8 else "••••"
             print(c.dim(f"  API key atual: {masked}"))
         print("  O que deseja fazer?")
@@ -4479,7 +4939,11 @@ def cmd_provider(sess, rest, c, tools_enabled):
             except (EOFError, KeyboardInterrupt):
                 new_key = ""
             if new_key:
-                cfg.setdefault("providers", {}).setdefault(arg, {})["api_key"] = new_key
+                if cfg.get("use_keyring") and _keyring_set(arg, new_key):
+                    cfg.setdefault("providers", {}).setdefault(arg, {})["api_key"] = "__keyring__"
+                    print(c.dim("  🔐 chave guardada no keyring do sistema."))
+                else:
+                    cfg.setdefault("providers", {}).setdefault(arg, {})["api_key"] = new_key
                 save_config(cfg)
                 print(c.green(f"✅ API key de '{arg}' atualizada."))
                 # ativa o provider
@@ -4502,6 +4966,7 @@ def cmd_provider(sess, rest, c, tools_enabled):
             if confirm in ("s", "sim", "y", "yes"):
                 if arg in cfg.get("providers", {}):
                     # se é preset, só limpa api_key, mantém base_url/model se custom
+                    _keyring_delete(arg)
                     if arg in PROVIDER_PRESETS:
                         cfg["providers"][arg].pop("api_key", None)
                         # se ficou vazio, remove entrada
@@ -4570,6 +5035,19 @@ def cmd_model(sess, rest, c, tools_enabled):
     cfg["model"] = name
     cfg.setdefault("providers", {}).setdefault(cfg.get("provider", "auto"), {})["model"] = name
     sess.model_id = name
+    # se havia override por modo para o modo atual, /model ganha: remove e avisa
+    mbm = cfg.get("model_by_mode")
+    if isinstance(mbm, dict) and mbm:
+        g = _MODE_GROUPS.get(cfg.get("mode", "coding"), "codigo")
+        same = {"chat": "chat", "codigo": "codigo", "plano": "plano"}
+        removed = [k for k, v in list(mbm.items())
+                   if k != "pensamento" and same.get(k) == g]
+        if removed:
+            for k in removed:
+                del mbm[k]
+            cfg["model_by_mode"] = mbm
+            print(c.yellow(f"  ↳ removido override por modo de: {', '.join(removed)} "
+                           "(era ele quem valia neste modo; use /agentes para recriar)"))
     save_config(cfg)
     print(f"✅ Modelo definido: {name}")
     return False, tools_enabled
@@ -4755,6 +5233,104 @@ def cmd_team(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+AGENT_MODES = {
+    "chat": "chat", "conversa": "chat",
+    "codigo": "codigo", "code": "codigo", "código": "codigo",
+    "plano": "plano", "plan": "plano",
+    "pensamento": "pensamento", "thinking": "pensamento",
+}
+
+
+def cmd_agentes(sess, rest, c, tools_enabled):
+    """Modelo POR MODO (grátis): /agentes mostra; /agentes codigo <id> define;
+    /agentes codigo auto limpa. O call_model troca sozinho conforme o modo."""
+    cfg = sess.cfg
+    mbm = cfg.get("model_by_mode")
+    if not isinstance(mbm, dict):
+        mbm = {}
+        cfg["model_by_mode"] = mbm
+
+    def _avail():
+        try:
+            return send_models_cached(cfg)[:12]
+        except Exception:
+            return []
+
+    parts = rest.split()
+    if not parts:
+        print(c.bold("🤖 Agentes — modelo por modo"))
+        for key, label in (("chat","💬 chat"), ("codigo","🛠 codigo"),
+                           ("plano","📋 plano"), ("pensamento","🧠 pensamento")):
+            m = mbm.get(key)
+            mark = m if m else c.dim("(global)")
+            print(f"  {label:<14} → {mark}")
+        avail = _avail()
+        if avail:
+            print(c.dim("  disponíveis agora: " + ", ".join(avail[:6])
+                        + ("…" if len(avail) > 6 else "")))
+        print(c.dim("  use: /agentes <modo> <modelo>   |   /agentes <modo> auto  limpa"))
+        print(c.dim("  ex.: /agentes codigo qwen2.5-coder-7b  ·  /agentes chat gemma-3-4b"))
+        return False, tools_enabled
+
+    mkey = AGENT_MODES.get(parts[0].lower())
+    if not mkey:
+        print(c.yellow(f"Modo desconhecido: {parts[0]}. Use chat | codigo | plano | pensamento."))
+        return False, tools_enabled
+
+    # só o modo: escolha interativa entre os modelos disponíveis
+    if len(parts) == 1:
+        try:
+            models = list_provider_models(cfg)
+        except Exception as e:
+            models = []
+            print(c.yellow(f"⚠ não consegui listar modelos ({e}); digite: /agentes {mkey} <id>"))
+        cur = mbm.get(mkey)
+        print(c.bold(f"Modelos para '{mkey}':"))
+        for i, mid in enumerate(models[:15], 1):
+            mark = " ← atual" if mid == cur else ""
+            print(f"  {i}. {mid}{mark}")
+        print("  0. auto (usar modelo global)")
+        try:
+            raw = input("Número ou id (Enter cancela): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return False, tools_enabled
+        if not raw:
+            return False, tools_enabled
+        if raw.isdigit():
+            n = int(raw)
+            if n == 0:
+                mbm.pop(mkey, None); cfg["model_by_mode"] = mbm; save_config(cfg)
+                sess.model_id = None
+                print(c.green(f"✅ '{mkey}' volta a usar o modelo global."))
+                return False, tools_enabled
+            if 1 <= n <= min(15, len(models)):
+                raw = models[n - 1]
+            else:
+                print(c.yellow("número inválido.")); return False, tools_enabled
+        mbm[mkey] = raw; cfg["model_by_mode"] = mbm; save_config(cfg)
+        sess.model_id = None
+        print(c.green(f"✅ Agente '{mkey}' usará '{raw}' (troca sozinho por modo)."))
+        return False, tools_enabled
+
+    # modo + modelo direto
+    model = " ".join(parts[1:]).strip()
+    if model.lower() in ("auto", "none", "nenhum", "off", "global"):
+        mbm.pop(mkey, None)
+        print(c.green(f"✅ '{mkey}' volta a usar o modelo global."))
+    else:
+        mbm[mkey] = model
+        print(c.green(f"✅ Agente '{mkey}' usará '{model}'."))
+    cfg["model_by_mode"] = mbm
+    save_config(cfg)
+    sess.model_id = None
+    return False, tools_enabled
+
+
+def send_models_cached(cfg):
+    """Modelos do cache p/ autocomplete (sem rede)."""
+    return _cached_models(cfg, try_fetch=False)
+
+
 def cmd_mcp(sess, rest, c, tools_enabled):
     """Mostra os servidores MCP; /mcp reload reconecta; /mcp <nome> detalha."""
     arg = rest.strip().lower()
@@ -4843,6 +5419,8 @@ def handle_command(sess, line, c, tools_enabled):
         return cmd_provider(sess, rest, c, tools_enabled)
     if cmd == "/model":
         return cmd_model(sess, rest, c, tools_enabled)
+    if cmd == "/agentes":
+        return cmd_agentes(sess, rest, c, tools_enabled)
     if cmd == "/models":
         try:
             models = list_provider_models(cfg)
@@ -5065,6 +5643,12 @@ def _command_completer(text, state):
     return None
 
 
+def _fuzzy_sub(q, name):
+    """Subsequência solta: 'prv' casa 'provider' (grátis, para autocomplete)."""
+    it = iter(name.lower())
+    return all(chx in it for chx in q)
+
+
 def _inline_matches(buf):
     """Retorna lista de sugestões inline para o buffer atual (com suporte a subcomandos).
 
@@ -5243,6 +5827,35 @@ def _inline_matches(buf):
                 return out[:6]
             except Exception:
                 return []
+        if cmd_low == "/agentes":
+            try:
+                modos = [("chat","",""),("codigo","",""),("plano","",""),
+                         ("pensamento","","")]
+                out = []
+                if not partial:
+                    for mkey,_,_ in modos:
+                        out.append((mkey, f"/agentes {mkey}", "modelo por modo"))
+                    return out[:6]
+                # segundo token: modelos em cache (sem rede)
+                first = partial.split()[0].lower() if partial else ""
+                has_second = len(rest.strip().split()) >= 1 and first in (
+                    "chat", "codigo", "code", "código", "plano", "plan",
+                    "pensamento", "thinking")
+                if (" " in rest.strip()) or has_second:
+                    models = send_models_cached(load_config())
+                    if cfg.get("model") and cfg["model"] not in models:
+                        models.insert(0, cfg["model"])
+                    last = partial.split()[-1] if partial.strip() else ""
+                    for m in models[:12]:
+                        if not last or m.lower().startswith(last.lower()):
+                            out.append((m, f"/agentes {rest.split()[0]} {m}", "modelo"))
+                    return out[:6]
+                for mkey,_,_ in modos:
+                    if mkey.startswith(partial.lower()):
+                        out.append((mkey, f"/agentes {mkey}", "modelo por modo"))
+                return out[:6]
+            except Exception:
+                return []
         if cmd_low == "/backend":
             cands = ["lmstudio", "ollama"]
             out = []
@@ -5257,17 +5870,25 @@ def _inline_matches(buf):
             return []
         # fallback: sem subcomando específico, não mostra nada (mantém comando)
         return []
-    # sem espaço: autocompleta comando de primeiro nível (só prefixo do nome)
+    # sem espaço: autocompleta comando de primeiro nível
+    # 1) prefixo; 2) fuzzy (subsequência) quando q >= 2 chars — grátis local
     q = stripped.lower().lstrip("/")
     groups = _command_groups()
-    out = []
+    out, seen = [], set()
+    def _push(name, syntax, desc):
+        if name not in seen:
+            seen.add(name); out.append((name, syntax, desc))
     for cat, cmds in groups:
         for name, syntax, desc in cmds:
-            if not q:
-                out.append((name, syntax, desc))
-            elif name.lower().lstrip("/").startswith(q):
-                out.append((name, syntax, desc))
-    return out  # mostra todos, draw faz scroll de 6 visíveis
+            if not q or name.lower().lstrip("/").startswith(q):
+                _push(name, syntax, desc)
+    if len(q) >= 2:
+        for cat, cmds in groups:
+            for name, syntax, desc in cmds:
+                nl = name.lower().lstrip("/")
+                if not nl.startswith(q) and _fuzzy_sub(q, nl):
+                    _push(name, syntax, desc)
+    return out  # draw faz scroll de 6 visíveis
 
 
 def _draw_inline_box(matches, selected, width):
@@ -5337,14 +5958,83 @@ def _input_with_inline_autocomplete(prompt, c):
     selected = 0
     prev_box_lines = 0
     prev_prompt_lines = 1
+    hmode = False
+    hquery = ""
+    hidx = 0
+    hmatches = []
+    saved_buf = ""
+
+    def _history_search(query):
+        """Busca substring (case-insensitive) nas mensagens do usuário salvas."""
+        try:
+            if not HISTORY_PATH.exists():
+                return []
+            res, seen = [], set()
+            ql = query.lower()
+            with open(HISTORY_PATH, encoding="utf-8") as f:
+                for ln in reversed(f.readlines()[-2000:]):
+                    try:
+                        rec = json.loads(ln)
+                    except Exception:
+                        continue
+                    if rec.get("role") != "user":
+                        continue
+                    txt = str(rec.get("content", "")).strip()
+                    if not txt or txt.startswith("/"):
+                        continue
+                    if ql and ql not in txt.lower():
+                        continue
+                    k = txt[:120]
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    res.append(txt)
+                    if len(res) >= 30:
+                        break
+            return res
+        except Exception:
+            return []
+
+    def _render_hist():
+        """Desenha a linha de busca do histórico (pseudo-box) e o prompt."""
+        nonlocal prev_box_lines
+        lines = []
+        if hmode:
+            cur = hmatches[hidx % len(hmatches)] if hmatches else ""
+            lines.append(c.dim(f"🔎 histórico: {hquery}▌  ({len(hmatches)} achados) ↑↓ · Enter usa · Esc sai"))
+            if cur:
+                lines.append(" " + cur[: max(10, width - 8)])
+        if prev_box_lines:
+            sys.stdout.write("\x1b[J")
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.write(visible_prompt + (hquery if hmode else buf))
+        else:
+            sys.stdout.write("\r\x1b[2K")
+            sys.stdout.write(visible_prompt + (hquery if hmode else buf))
+        if lines:
+            sys.stdout.write("\x1b[s")
+            sys.stdout.write("\r\n" + "\r\n".join(lines))
+            sys.stdout.write("\x1b[u")
+            prev_box_lines = len(lines)
+        else:
+            prev_box_lines = 0
+        sys.stdout.flush()
 
     def _prompt_lines():
         try:
             clean = re.sub(r"\x1b\[[0-9;]*m", "", visible_prompt)
-            total = len(clean) + len(buf)
-            return max(1, (total + width - 1) // width)
+            import unicodedata as _ud
+            w = 0
+            for chx in clean + buf:
+                w += 2 if _ud.east_asian_width(chx) in ("W", "F") else 1
+            lines = max(1, (w + width - 1) // width)
+            return min(lines, 3)
         except Exception:
-            return 1
+            try:
+                clean = re.sub(r"\x1b\[[0-9;]*m", "", visible_prompt)
+                return max(1, min((len(clean) + len(buf) + width - 1) // width, 3))
+            except Exception:
+                return 1
 
     def _redraw():
         nonlocal prev_box_lines, prev_prompt_lines
@@ -5391,28 +6081,86 @@ def _input_with_inline_autocomplete(prompt, c):
 
     sys.stdout.write(visible_prompt)
     sys.stdout.flush()
+    key_queue = ""
     try:
         tty.setraw(fd)
         while True:
             try:
-                ch = os.read(fd, 1).decode(errors="ignore")
+                ev = _read_utf8_event(fd)
             except OSError:
-                ch = ""
-            if not ch:
+                ev = ""
+            if ev:
+                key_queue += ev
+            if not key_queue:
                 continue
+            ch = key_queue[0]
+            key_queue = key_queue[1:]
             # Ctrl+C
             if ch == "\x03":
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 raise KeyboardInterrupt
+            # Ctrl+R -> busca no histórico (grátis, local)
+            if ch == "\x12" or hmode:
+                if ch == "\x12" and not hmode:
+                    hmode = True
+                    hquery = ""
+                    hidx = 0
+                    hmatches = _history_search("")
+                    saved_buf = buf
+                elif hmode:
+                    if ch in ("\r", "\n"):
+                        if hmatches:
+                            buf = hmatches[min(hidx, len(hmatches)-1)]
+                        else:
+                            buf = saved_buf
+                        hmode = False
+                        selected = 0
+                        _redraw()
+                        continue
+                    if ch == "\x1b":
+                        # pode ser Esc sozinho (sai) ou seta ↑↓ (navega)
+                        b1 = _read_nonblock(fd)
+                        if b1 is None:
+                            import select as _s2
+                            _s2.select([sys.stdin], [], [], 0.05)
+                            b1 = _read_nonblock(fd)
+                        b2 = _read_nonblock(fd) if b1 == "[" else None
+                        seq = (b1 or "") + (b2 or "")
+                        if seq == "[A" and hmatches:
+                            hidx = (hidx - 1) % len(hmatches)
+                            _render_hist()
+                            continue
+                        if seq == "[B" and hmatches:
+                            hidx = (hidx + 1) % len(hmatches)
+                            _render_hist()
+                            continue
+                        hmode = False
+                        buf = saved_buf
+                        selected = 0
+                        _redraw()
+                        continue
+                    if ch in ("\x7f", "\x08"):
+                        hquery = hquery[:-1]
+                    elif ch == "\x12":
+                        pass
+                    elif ch.isprintable():
+                        hquery += ch
+                    else:
+                        continue
+                    hmatches = _history_search(hquery)
+                    hidx = 0
+                _render_hist()
+                continue
+
             # Enter
             if ch in ("\r", "\n"):
                 # se tem autocomplete ativo e um selecionado, completa?
                 # Para inline, Enter confirma o buffer atual (se for comando conhecido, o repl vai tratar)
                 # Se o buffer é só "/" e tem seleção, completa para o selecionado
-                if buf.startswith("/") and _inline_matches(buf):
-                    matches = _inline_matches(buf)
-                    if matches:
+                matches = _inline_matches(buf) if buf.startswith("/") else None
+                if matches:
+                    if True:
                         # se buf tem subcomando, completa subcomando; senão comando
                         # só auto-completa se ainda é prefixo
                         if " " in buf:
@@ -5515,7 +6263,15 @@ def _input_with_inline_autocomplete(prompt, c):
                     if nxt is None:
                         break
                     seq += nxt
-                if seq == "[A":  # ↑
+                if seq == "[A" and hmode:  # ↑ no histórico
+                    if hmatches:
+                        hidx = (hidx - 1) % len(hmatches)
+                        _render_hist()
+                elif seq == "[B" and hmode:  # ↓
+                    if hmatches:
+                        hidx = (hidx + 1) % len(hmatches)
+                        _render_hist()
+                elif seq == "[A":  # ↑
                     if buf.startswith("/"):
                         matches = _inline_matches(buf)
                         if matches:
@@ -5550,6 +6306,17 @@ def _input_with_inline_autocomplete(prompt, c):
             if ch == "\x0c":
                 _redraw()
                 continue
+            if ch.isdigit() and buf.startswith("/") and " " not in buf \
+                    and not hmode:
+                ms = _inline_matches(buf)
+                n = int(ch)
+                if ms and 1 <= n <= min(6, len(ms)):
+                    token = buf.split()[0]
+                    sel_name = ms[n - 1][0]
+                    buf = sel_name + (buf[len(token):] if len(buf) > len(token) else "")
+                    selected = 0
+                    _redraw()
+                    continue
             if ch.isprintable():
                 buf += ch
                 selected = 0
@@ -5603,18 +6370,28 @@ def _rl_prompt(s):
     return re.sub(r"(\x1b\[[0-9;]*m)", r"\001\1\002", s)
 
 
+PROMPT_MODE_STYLE = {
+    "CODING": ("🛠", "cyan"), "CHAT": ("💬", "blue"), "PLAN": ("📋", "magenta"),
+    "WORKFLOW": ("🔁", "magenta"),
+}
+
+
 def make_prompt(c, sess):
-    badge = (sess.model_id or "?").rsplit("/", 1)[-1][:24]
+    """Prompt compacto com chip colorido por modo (grátis)."""
+    badge = (sess.model_id or "?").rsplit("/", 1)[-1][:20]
     mode = sess.cfg["mode"].upper()
-    mode_icons = {"CODING": "🛠", "CHAT": "💬", "PLAN": "📋", "WORKFLOW": "🔁"}
-    mi = mode_icons.get(mode, "❯")
-    think = " 🧠" if sess.cfg["thinking"] else ""
-    out = " 🔥" if sess.cfg.get("outmode") else ""
+    icon, col = PROMPT_MODE_STYLE.get(mode, ("▸", "white"))
+    think = " 🧠" if sess.cfg.get("thinking") else ""
+    outmode = sess.cfg.get("outmode")
+    colfn = getattr(c, col)
     if c.enabled:
-        prompt = (f"{c.bold(c.cyan('send'))}{c.dim('(' + badge + '·')}"
-                  f"{mi}{c.dim(mode + ')')}{think}{out} {c.bold('❯')} ")
+        prompt = (f"{c.bold(colfn(icon + ' ' + mode.lower()))}"
+                  f"{c.dim(' · ' + badge)}"
+                  + (c.magenta(think) if think else "")
+                  + (c.red(" 🔥") if outmode else "")
+                  + f" {c.bold(colfn('❯'))} ")
         return _rl_prompt(prompt)
-    return f"send({badge}·{mode}){think}{out} ❯ "
+    return f"{mode.lower()}({badge}){think}{' 🔥' if outmode else ''} ❯ "
 
 
 def repl(sess, c, tools_enabled):
@@ -5624,6 +6401,19 @@ def repl(sess, c, tools_enabled):
                             and sess.mode_override is None) else cfg["mode"])
     banner(c, model=(sess.model_id or cfg.get("model") or "auto"),
            mode=show_mode)
+
+    # Worktree isolado por sessão (grátis, local) — desligado por padrão
+    _wt_path = None
+    _orig_cwd = Path.cwd()
+    if cfg.get("worktree"):
+        _wt_path = _worktree_create(c)
+        if _wt_path:
+            try:
+                os.chdir(_wt_path)
+                print(c.dim(f"  📂 cwd: {_wt_path}"))
+            except Exception as e:
+                print(c.yellow(f"  ⚠ não pude entrar no worktree: {e}"))
+
     run_hooks("SessionStart", c, sess.cfg, prompt="modo interativo")
 
     if readline:
@@ -5747,8 +6537,7 @@ def repl(sess, c, tools_enabled):
     # limpa worktree isolado se criou (grátis)
     try:
         if '_wt_path' in locals() and _wt_path:
-            import os as _os_wt
-            _os_wt.chdir(_orig_cwd)
+            os.chdir(_orig_cwd)
             _worktree_remove(_wt_path, c)
     except Exception:
         pass
@@ -5948,6 +6737,8 @@ def parse_args(argv=None):
                     "modelo disponível no provider)")
     ap.add_argument("-u", "--base-url", default=None,
                     help=f"URL do servidor (padrão: {DEFAULT_BASE_URL})")
+    ap.add_argument("--continue", "-C", dest="cont", action="store_true",
+                    help="retoma a conversa salva mais recente (~/.send/sessions/)")
     ap.add_argument("-c", "--code", action="store_true",
                     help="modo coding: pode ler/escrever arquivos e executar comandos")
     ap.add_argument("-p", "--plan", action="store_true",
@@ -6090,6 +6881,28 @@ def main(argv=None):
 
     # -y vale só para esta sessão (não vai para a config salva)
     sess.auto_confirm = bool(args.yes) or bool(cfg["auto_confirm"])
+
+    # --continue / -C: retoma a conversa salva mais recente (grátis)
+    if getattr(args, "cont", False):
+        sdir = SEND_HOME / "sessions"
+        try:
+            files = sorted(sdir.glob("*.json"), key=lambda f: f.stat().st_mtime)
+        except Exception:
+            files = []
+        if not files:
+            print(c.yellow("Nenhuma sessão salva em ~/.send/sessions/ — iniciando nova."))
+        else:
+            latest = files[-1]
+            try:
+                data = json.loads(latest.read_text(encoding="utf-8"))
+                if isinstance(data, list) and all(isinstance(m, dict) and "role" in m for m in data):
+                    sess.messages = data
+                    print(c.green(f"↩ Retomada a sessão mais recente: {latest.name} "
+                                  f"({len(data)} mensagens)"))
+                else:
+                    print(c.yellow(f"⚠ {latest.name} não parece uma sessão do SEND."))
+            except Exception as e:
+                print(c.yellow(f"⚠ falha ao carregar {latest.name}: {e}"))
     if args.save_code:
         cfg["auto_save_code"] = True
     if args.outmode:
