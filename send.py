@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.11.1"
+VERSION = "1.12.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -598,6 +598,9 @@ DEFAULT_CONFIG = {
     # Memória limitada grátis (sem API) — evita injeção infinita no prompt
     "memory_char_limit": 2200,     # ~800 tokens, pruned automaticamente
     "memory_nudge_interval": 10,   # a cada 10 turnos lembra o modelo de salvar
+    # Worktree isolado (grátis, local) — cada sessão pode ter seu worktree
+    "worktree": False,             # True = cria worktree isolado por sessão
+    "worktree_sync": True,         # True = branch do remote tip, False = do HEAD local
 }
 
 # Backups automáticos antes de editar/escrever arquivos
@@ -1555,6 +1558,66 @@ def detect_backend(cfg, c):
         return cfg["base_url"]
 
 
+def _worktree_create(c):
+    """Cria worktree isolado para a sessão atual (grátis, local). Retorna Path ou None."""
+    try:
+        import subprocess, time, shutil
+        root = Path.cwd()
+        # verifica se é repo git
+        r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, timeout=5)
+        if r.returncode != 0 or r.stdout.strip() != "true":
+            return None
+        # nome worktree: .send/worktrees/sess-<ts>
+        wt_base = SEND_HOME / "worktrees"
+        wt_base.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        wt_path = wt_base / f"sess-{ts}"
+        # branch base
+        cfg_tmp = load_config()
+        if cfg_tmp.get("worktree_sync", True):
+            # tenta fetch e branch do upstream
+            subprocess.run(["git", "fetch", "--quiet"], timeout=15)
+            # descobre upstream ou default branch
+            br = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True, timeout=5).stdout.strip()
+            upstream = ""
+            if br:
+                up = subprocess.run(["git", "rev-parse", "--abbrev-ref", f"{br}@{{u}}"], capture_output=True, text=True, timeout=5)
+                if up.returncode == 0:
+                    upstream = up.stdout.strip()
+            if not upstream:
+                # tenta origin/HEAD
+                head = subprocess.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], capture_output=True, text=True, timeout=5)
+                if head.returncode == 0:
+                    upstream = head.stdout.strip().split("/")[-1]
+                    upstream = f"origin/{upstream}"
+            base_ref = upstream if upstream else "HEAD"
+        else:
+            base_ref = "HEAD"
+        # cria worktree
+        r2 = subprocess.run(["git", "worktree", "add", "-b", f"send/{ts}", str(wt_path), base_ref], capture_output=True, text=True, timeout=15)
+        if r2.returncode != 0:
+            # tenta sem -b se branch já existe
+            r2 = subprocess.run(["git", "worktree", "add", str(wt_path), base_ref], capture_output=True, text=True, timeout=15)
+            if r2.returncode != 0:
+                return None
+        print(c.dim(f"  🌿 worktree isolado: {wt_path} (de {base_ref})"))
+        return wt_path
+    except Exception as e:
+        try:
+            print(c.yellow(f"  ⚠ worktree falhou: {e}"))
+        except Exception:
+            pass
+        return None
+
+def _worktree_remove(wt_path, c):
+    try:
+        import subprocess
+        if wt_path and wt_path.exists():
+            subprocess.run(["git", "worktree", "remove", "--force", str(wt_path)], capture_output=True, timeout=10)
+            print(c.dim(f"  🧹 worktree removido: {wt_path}"))
+    except Exception:
+        pass
+
 def project_tree(max_entries=25, max_depth=2):
     """Árvore curta do diretório atual para dar contexto ao modelo."""
     try:
@@ -1851,10 +1914,46 @@ def _model_ids(data):
     return out
 
 
+_MODEL_CACHE = {"models": [], "ts": 0, "provider": ""}
+_MODEL_CACHE_LAST_TRY = 0
+
 def list_provider_models(cfg):
+    global _MODEL_CACHE
     data = http_json(provider_api_url(cfg, "models"),
                      api_key=provider_api_key(cfg), method="GET")
-    return _model_ids(data)
+    models = _model_ids(data)
+    # cache grátis local
+    try:
+        import time as _t
+        _MODEL_CACHE = {"models": models, "ts": _t.time(), "provider": cfg.get("provider","")}
+    except Exception:
+        pass
+    return models
+
+def _cached_models(cfg, try_fetch=False):
+    """Retorna modelos do cache; se try_fetch e cache vazio, tenta HTTP rápido sem travar (debounce 5s)."""
+    global _MODEL_CACHE_LAST_TRY
+    try:
+        import time as _t
+        if _MODEL_CACHE.get("provider") == cfg.get("provider") and _t.time() - _MODEL_CACHE.get("ts",0) < 60 and _MODEL_CACHE.get("models"):
+            return _MODEL_CACHE["models"]
+        if try_fetch and _t.time() - _MODEL_CACHE_LAST_TRY < 5:
+            # debounce: não tenta de novo tão rápido para não travar após 3 /
+            return _MODEL_CACHE.get("models", [])
+    except Exception:
+        pass
+    if try_fetch:
+        try:
+            import time as _t2
+            _MODEL_CACHE_LAST_TRY = _t2.time()
+            models = list_provider_models(cfg)[:12]
+            return models
+        except Exception:
+            pass
+    try:
+        return _MODEL_CACHE.get("models", [])
+    except Exception:
+        return []
 
 
 def resolve_model(cfg, c):
@@ -3914,6 +4013,7 @@ COMMANDS = [
     ("/contexto", "/contexto [on|off]", "Liga/desliga o contexto do projeto no prompt", "sistema"),
     ("/subagentes", "/subagentes [nome] [tarefa]", "Lista os subagentes ou roda um (ex.: /subagentes revisor revise este código)", "sistema"),
     ("/team", "/team <agentes> <tarefa>", "Equipe de 2+ IAs colaborando (ex.: /team revisor,pesquisador crie uma API) — pode usar 'nome@model' para modelos diferentes", "sistema"),
+    ("/worktree", "/worktree [on|off]", "Worktree isolado por sessão (git worktree) - cada sessão em branch separado", "sistema"),
     ("/mcp", "/mcp [nome|reload]", "Mostra os servidores MCP (ferramentas externas) e reconecta", "sistema"),
     ("/hooks", "/hooks", "Mostra os hooks configurados (~/.send/hooks.json)", "sistema"),
     ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o servidor", "sistema"),
@@ -4046,12 +4146,14 @@ def show_command_menu(c, initial_query=""):
         if not query:
             return True
         q = query.strip().lower().lstrip("/")
-        # O nome recebe prioridade: `p` sugere /provider, /plan etc. A busca
-        # por palavras na descrição continua útil para consultas mais longas.
+        # Só prefixo do nome para autocomplete inline/paleta (evita /model mostrar /pensamento via descrição "modelo")
         if name.lower().lstrip("/").startswith(q):
             return True
-        hay = f"{name} {syntax} {desc}".lower()
-        return len(q) > 1 and all(part in hay for part in q.split())
+        # Busca por descrição só se query tem 3+ chars e não é prefixo simples (ex: "provider openai")
+        if len(q) > 2 and " " in q:
+            hay = f"{name} {syntax} {desc}".lower()
+            return all(part in hay for part in q.split())
+        return False
 
     def build(query):
         items = []  # ("cat", nome) ou ("cmd", nome, sintaxe, desc)
@@ -4335,6 +4437,94 @@ def cmd_provider(sess, rest, c, tools_enabled):
     if arg not in PROVIDER_PRESETS and arg not in configured and arg != "custom":
         print(c.yellow(f"Provider desconhecido: {arg}. Use /provider para listar."))
         return False, tools_enabled
+    # Se já tem API key/configurado, mostra menu: reescrever, excluir ou sair
+    spec_check = PROVIDER_PRESETS.get(arg, {}) if arg in PROVIDER_PRESETS else configured.get(arg, {})
+    has_key = False
+    if arg in PROVIDER_PRESETS:
+        # preset local não tem key
+        if not spec_check.get("local"):
+            # verifica se já tem api_key salva ou env
+            if arg in configured and configured[arg].get("api_key"):
+                has_key = True
+            elif os.environ.get(spec_check.get("env_key", "")):
+                has_key = True
+            # também verifica se o provider já foi ativado antes e tem api_key em providers
+            # (caso de custom)
+    else:
+        # custom sempre tem config
+        has_key = True
+    # também considera se o provider já está em cfg["providers"] com api_key
+    if arg in configured and isinstance(configured[arg], dict) and configured[arg].get("api_key"):
+        has_key = True
+    if has_key and arg != "custom":
+        print(c.cyan(f"● Provider '{arg}' já configurado."))
+        # verifica se tem api_key para mostrar
+        existing = configured.get(arg, {}).get("api_key", "") if isinstance(configured.get(arg), dict) else ""
+        if existing:
+            masked = existing[:4] + "…" + existing[-4:] if len(existing) > 8 else "••••"
+            print(c.dim(f"  API key atual: {masked}"))
+        print("  O que deseja fazer?")
+        print("    1. Reescrever API key")
+        print("    2. Excluir configuração")
+        print("    3. Sair do menu")
+        try:
+            choice = input(c.dim("  Escolha [1/2/3] (Enter para sair): ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            choice = ""
+        if choice == "1":
+            # reescrever
+            try:
+                import getpass
+                new_key = getpass.getpass(f"Nova API key para {arg} (Enter cancela): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                new_key = ""
+            if new_key:
+                cfg.setdefault("providers", {}).setdefault(arg, {})["api_key"] = new_key
+                save_config(cfg)
+                print(c.green(f"✅ API key de '{arg}' atualizada."))
+                # ativa o provider
+                try:
+                    activate_provider(cfg, arg)
+                    sess.model_id = None
+                    spec = provider_spec(cfg)
+                    print(c.green(f"✅ Provider ativo: {spec['name']} ({cfg['base_url']})"))
+                except Exception as e:
+                    print(c.yellow(f"⚠ Falha ao ativar: {e}"))
+            else:
+                print(c.dim("  Cancelado."))
+            return False, tools_enabled
+        elif choice == "2":
+            # excluir
+            try:
+                confirm = input(c.yellow(f"  Confirmar exclusão de '{arg}'? (s/N): ")).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = ""
+            if confirm in ("s", "sim", "y", "yes"):
+                if arg in cfg.get("providers", {}):
+                    # se é preset, só limpa api_key, mantém base_url/model se custom
+                    if arg in PROVIDER_PRESETS:
+                        cfg["providers"][arg].pop("api_key", None)
+                        # se ficou vazio, remove entrada
+                        if not cfg["providers"][arg]:
+                            del cfg["providers"][arg]
+                    else:
+                        del cfg["providers"][arg]
+                    save_config(cfg)
+                    print(c.green(f"🗑 Provider '{arg}' removido."))
+                    # se era o ativo, volta para auto
+                    if cfg.get("provider") == arg:
+                        cfg["provider"] = "auto"
+                        save_config(cfg)
+                        sess.model_id = None
+                        print(c.dim("  Voltou para provider auto (local)."))
+                else:
+                    print(c.yellow("  Nada para excluir."))
+            else:
+                print(c.dim("  Cancelado."))
+            return False, tools_enabled
+        else:
+            print(c.dim("  Saindo do menu."))
+            return False, tools_enabled
     selected = configure_provider(cfg, arg, c)
     if not selected:
         return False, tools_enabled
@@ -4822,6 +5012,14 @@ def handle_command(sess, line, c, tools_enabled):
         return cmd_subagentes(sess, rest, c, tools_enabled)
     if cmd == "/team":
         return cmd_team(sess, rest, c, tools_enabled)
+    if cmd == "/worktree":
+        if rest in ("on", "off"):
+            sess.cfg["worktree"] = rest == "on"
+            save_config(sess.cfg)
+            print(f"🌿 Worktree: {'ligado' if rest=='on' else 'desligado'}")
+        else:
+            print(f"🌿 Worktree: {'ligado' if sess.cfg.get('worktree') else 'desligado'} (use /worktree on|off)")
+        return False, tools_enabled
     if cmd == "/mcp":
         return cmd_mcp(sess, rest, c, tools_enabled)
     if cmd == "/hooks":
@@ -4867,40 +5065,245 @@ def _command_completer(text, state):
     return None
 
 
-def _inline_matches(query):
-    """Retorna lista de comandos que casam com query (para autocomplete inline)."""
-    if not query:
+def _inline_matches(buf):
+    """Retorna lista de sugestões inline para o buffer atual (com suporte a subcomandos).
+
+    - Se buf é "/prov" -> sugere comandos que começam com "prov"
+    - Se buf é "/provider " ou "/provider o" -> sugere providers
+    - Vale para /model, /skills, /config, /subagentes, /team, etc.
+    Grátis: usa dados locais, sem API paga (exceto /model que pode listar do provider se já conectado).
+    """
+    if not buf or not buf.strip().startswith("/"):
         return []
-    q = query.strip().lower().lstrip("/")
+    # separa primeiro token (comando) do resto - detecta subcomando mesmo com espaço no fim (ex: "/provider ")
+    stripped = buf.strip()
+    has_space = " " in stripped or buf.endswith(" ") or buf.endswith("\t")
+    if has_space:
+        if " " in stripped:
+            cmd, rest = stripped.split(None, 1)
+        else:
+            # caso "/provider " (com espaço mas sem segundo token)
+            cmd = stripped
+            rest = ""
+        cmd_low = cmd.lower()
+        partial = rest.strip().split()[-1] if rest.strip() else ""
+        # /provider -> lista providers
+        if cmd_low == "/provider":
+            try:
+                cands = list(PROVIDER_PRESETS.keys())
+                import json as _js
+                custom_data = {}
+                if CONFIG_PATH.exists():
+                    try:
+                        custom_data = _js.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("providers", {})
+                        for k in custom_data.keys():
+                            if k not in cands:
+                                cands.append(k)
+                    except Exception:
+                        pass
+                cands = sorted(set(cands))
+                # marca quais estão conectados (tem api_key ou é local)
+                def _is_connected(prov):
+                    spec_tmp = PROVIDER_PRESETS.get(prov, {})
+                    custom_tmp = custom_data.get(prov, {}) if isinstance(custom_data, dict) else {}
+                    if spec_tmp.get("local"):
+                        return True
+                    if custom_tmp.get("api_key"):
+                        return True
+                    # verifica env var
+                    import os as _os2
+                    envk = spec_tmp.get("env_key", "")
+                    if envk and _os2.environ.get(envk):
+                        return True
+                    return False
+                out = []
+                for prov in cands:
+                    if not partial or prov.lower().startswith(partial.lower()) or partial.lower() in prov.lower():
+                        spec = PROVIDER_PRESETS.get(prov, {})
+                        custom = custom_data.get(prov, {}) if isinstance(custom_data, dict) else {}
+                        name = spec.get("name", prov) if isinstance(spec, dict) else prov
+                        base = custom.get("base_url") or spec.get("base_url", "")
+                        try:
+                            from urllib.parse import urlparse as _up
+                            host = _up(base).netloc or base
+                            if host.startswith("www."):
+                                host = host[4:]
+                        except Exception:
+                            host = base
+                        model = custom.get("model") or ""
+                        local = spec.get("local", False)
+                        connected = _is_connected(prov)
+                        parts = [name]
+                        if host:
+                            parts.append(host)
+                        if model:
+                            parts.append(f"· {model}")
+                        if local:
+                            parts.append("(local grátis)")
+                        if connected:
+                            parts.append("✅")
+                        desc = " - ".join(parts)
+                        out.append((prov, f"/provider {prov}", desc))
+                # mostra até 12, com scroll via ↑↓ (grátis)
+                return out[:12]
+            except Exception:
+                return []
+        if cmd_low == "/model":
+            # inline rápido - mostra modelos do provider atual + também do Ollama/LM Studio se não for local
+            try:
+                cfg_tmp = load_config()
+                spec = provider_spec(cfg_tmp)
+                prov_name = spec.get("name", cfg_tmp.get("provider","auto"))
+                models = _cached_models(cfg_tmp, try_fetch=True)
+                # fallback: modelo atual + salvos
+                if not models:
+                    if cfg_tmp.get("model"):
+                        models.append(cfg_tmp["model"])
+                    for prov_cfg in cfg_tmp.get("providers", {}).values():
+                        if isinstance(prov_cfg, dict) and prov_cfg.get("model") and prov_cfg["model"] not in models:
+                            models.append(prov_cfg["model"])
+                # Se provider atual não é local, também mostra modelos locais (Ollama/LM Studio) para não sumir
+                # Grátis: usa cache do provider auto sem fazer HTTP extra se já tiver
+                if not spec.get("local"):
+                    try:
+                        local_cfg = dict(cfg_tmp)
+                        local_cfg["provider"] = "auto"
+                        local_models = _cached_models(local_cfg, try_fetch=False)
+                        for lm in local_models:
+                            if lm not in models:
+                                models.append(lm)
+                        # também adiciona do config local
+                        if not local_models and local_cfg.get("model") and local_cfg["model"] not in models:
+                            models.append(local_cfg["model"])
+                    except Exception:
+                        pass
+                if not models:
+                    if not partial:
+                        return [("model", "/model <nome>", f"{prov_name} - digite o nome ou use /models para listar")]
+                    return []
+                out = []
+                for m in models:
+                    if not partial or m.lower().startswith(partial.lower()) or partial.lower() in m.lower():
+                        # desc rica: de onde é + modelo
+                        # tenta descobrir de qual provider é o modelo
+                        where = prov_name
+                        # se for da lista local adicionada, marca
+                        if m in (_cached_models({"provider":"auto"}, try_fetch=False) or []):
+                            where = "LM Studio/Ollama (local)"
+                        desc = f"{where} · {m}"
+                        if spec.get("local") or where.startswith("LM Studio"):
+                            desc += " (local)"
+                        out.append((m, f"/model {m}", desc))
+                if not out and not partial:
+                    for m in models[:12]:
+                        desc = f"{prov_name} · {m}"
+                        if spec.get("local"):
+                            desc += " (local)"
+                        out.append((m, f"/model {m}", desc))
+                return out  # mostra todos, draw faz scroll de 6 visíveis
+            except Exception:
+                return []
+        if cmd_low == "/models":
+            return []
+        if cmd_low == "/skills":
+            try:
+                cands = list(SKILL_ORDER)
+                for cs in load_custom_skills():
+                    if cs["name"] not in cands:
+                        cands.append(cs["name"])
+                cands.extend(["on", "off"])
+                out = []
+                for c in cands:
+                    if not partial or c.lower().startswith(partial.lower()):
+                        out.append((c, f"/skills {c}", SKILLS.get(c, "") or c))
+                return out[:6]
+            except Exception:
+                return []
+        if cmd_low == "/config":
+            try:
+                keys = list(EDITABLE_CONFIG.keys())
+                out = []
+                for k in keys:
+                    if not partial or k.lower().startswith(partial.lower()):
+                        out.append((k, f"/config {k}", "chave de configuração"))
+                return out[:6]
+            except Exception:
+                return []
+        if cmd_low in ("/subagentes", "/team"):
+            try:
+                sas = load_subagents()
+                names = [s["name"] for s in sas]
+                # para /team, pode ter múltiplos separados por vírgula
+                # pega último token após vírgula
+                last = partial.split(",")[-1].strip() if "," in partial else partial
+                out = []
+                for n in names:
+                    if not last or n.lower().startswith(last.lower()):
+                        out.append((n, f"{cmd} {n}", "subagente"))
+                return out[:6]
+            except Exception:
+                return []
+        if cmd_low == "/backend":
+            cands = ["lmstudio", "ollama"]
+            out = []
+            for b in cands:
+                if not partial or b.lower().startswith(partial.lower()):
+                    out.append((b, f"/backend {b}", "servidor"))
+            return out[:6]
+        if cmd_low in ("/thinking", "/contexto", "/automode", "/outmode"):
+            for v in ["on", "off"]:
+                if not partial or v.startswith(partial.lower()):
+                    return [(v, f"{cmd} {v}", v)]
+            return []
+        # fallback: sem subcomando específico, não mostra nada (mantém comando)
+        return []
+    # sem espaço: autocompleta comando de primeiro nível (só prefixo do nome)
+    q = stripped.lower().lstrip("/")
     groups = _command_groups()
     out = []
     for cat, cmds in groups:
         for name, syntax, desc in cmds:
-            # mesmo critério do show_command_menu
             if not q:
                 out.append((name, syntax, desc))
             elif name.lower().lstrip("/").startswith(q):
                 out.append((name, syntax, desc))
-            elif len(q) > 1 and all(part in f"{name} {syntax} {desc}".lower() for part in q.split()):
-                out.append((name, syntax, desc))
-    return out[:6]  # mini barra: máximo 6 sugestões
+    return out  # mostra todos, draw faz scroll de 6 visíveis
 
 
 def _draw_inline_box(matches, selected, width):
-    """Desenha mini barra inline tipo Claude Code (acima do prompt)."""
+    """Desenha mini barra inline tipo Claude Code (acima do prompt) com scroll."""
     if not matches:
         return []
     lines = []
-    # borda superior sutil
     lines.append("  \x1b[2m┌─ autocomplete ─────────────────────\x1b[0m")
-    for i, (name, syntax, desc) in enumerate(matches):
-        syn = syntax[:34].ljust(34)
-        d = desc[: max(10, width - 50)]
-        if i == selected:
-            # destaque invertido
-            lines.append(f"\x1b[48;5;26;1m ❯ {syn} {d}\x1b[0m")
-        else:
-            lines.append(f"   {syn} \x1b[2m{d}\x1b[0m")
+    # janela deslizante de até 6 visíveis, com scroll
+    max_vis = 6
+    start = 0
+    if len(matches) > max_vis:
+        # mantém selecionado visível no meio
+        start = max(0, min(selected - max_vis // 2, len(matches) - max_vis))
+        end = start + max_vis
+        # indica que tem mais acima/abaixo
+        if start > 0:
+            lines.append(f"  \x1b[2m··· {start} acima ···\x1b[0m")
+        for i in range(start, end):
+            name, syntax, desc = matches[i]
+            syn = syntax[:34].ljust(34)
+            d = desc[: max(10, width - 50)]
+            if i == selected:
+                lines.append(f"\x1b[48;5;26;1m ❯ {syn} {d}\x1b[0m")
+            else:
+                lines.append(f"   {syn} \x1b[2m{d}\x1b[0m")
+        if end < len(matches):
+            lines.append(f"  \x1b[2m··· {len(matches) - end} abaixo ···\x1b[0m")
+    else:
+        for i, (name, syntax, desc) in enumerate(matches):
+            syn = syntax[:34].ljust(34)
+            d = desc[: max(10, width - 50)]
+            if i == selected:
+                lines.append(f"\x1b[48;5;26;1m ❯ {syn} {d}\x1b[0m")
+            else:
+                lines.append(f"   {syn} \x1b[2m{d}\x1b[0m")
     lines.append("  \x1b[2m└─ ↑↓ navegar · Tab completar · Enter selecionar · Esc fechar\x1b[0m")
     return lines
 
@@ -4945,28 +5348,44 @@ def _input_with_inline_autocomplete(prompt, c):
 
     def _redraw():
         nonlocal prev_box_lines, prev_prompt_lines
-        # limpa box anterior + linhas do prompt anterior (sem apagar conversa acima)
-        if prev_box_lines or prev_prompt_lines > 1:
-            move_up = prev_box_lines + prev_prompt_lines
-            sys.stdout.write(f"\x1b[{move_up}A")
+        # limpa apenas o que está abaixo do prompt (box anterior) - nunca apaga acima
+        # primeiro limpa linha do prompt atual
+        if prev_box_lines:
+            # estamos no fim do prompt, box está abaixo: limpa abaixo
             sys.stdout.write("\x1b[J")
-        else:
             sys.stdout.write("\r\x1b[2K")
-        # desenha box se buf começa com /
+            sys.stdout.write(visible_prompt + buf)
+        else:
+            # sem box anterior, só limpa e redesenha prompt
+            if prev_prompt_lines > 1:
+                # prompt quebrou em várias linhas, volta ao início dele
+                sys.stdout.write(f"\x1b[{prev_prompt_lines-1}A\r\x1b[J")
+                sys.stdout.write(visible_prompt + buf)
+            else:
+                sys.stdout.write("\r\x1b[2K")
+                sys.stdout.write(visible_prompt + buf)
+        # desenha box ABAIXO do prompt (não acima) - não apaga conversa acima
         box = []
-        if buf.startswith("/"):
-            q = buf.split()[0]
-            matches = _inline_matches(q)
+        # desativa autocomplete para texto muito grande (evita quadrados por linha)
+        if len(buf) > 500:
+            box = []
+        elif buf.startswith("/"):
+            matches = _inline_matches(buf)
             if matches:
                 nonlocal_selected = max(0, min(selected, len(matches) - 1))
                 box = _draw_inline_box(matches, nonlocal_selected, width)
-        # escreve box + prompt + buffer
         if box:
-            sys.stdout.write("\r\n".join(box) + "\r\n")
+            # salva cursor no fim do prompt
+            sys.stdout.write("\x1b[s")
+            sys.stdout.write("\r\n" + "\r\n".join(box))
+            # restaura cursor para o fim do prompt (para continuar digitando)
+            sys.stdout.write("\x1b[u")
             prev_box_lines = len(box)
         else:
+            # sem box, garante que área abaixo está limpa (apaga box antigo)
+            if prev_box_lines:
+                sys.stdout.write("\x1b[J")
             prev_box_lines = 0
-        sys.stdout.write(visible_prompt + buf)
         prev_prompt_lines = _prompt_lines()
         sys.stdout.flush()
 
@@ -4991,38 +5410,89 @@ def _input_with_inline_autocomplete(prompt, c):
                 # se tem autocomplete ativo e um selecionado, completa?
                 # Para inline, Enter confirma o buffer atual (se for comando conhecido, o repl vai tratar)
                 # Se o buffer é só "/" e tem seleção, completa para o selecionado
-                if buf.startswith("/") and _inline_matches(buf.split()[0]):
-                    matches = _inline_matches(buf.split()[0])
+                if buf.startswith("/") and _inline_matches(buf):
+                    matches = _inline_matches(buf)
                     if matches:
-                        # se buf é só prefixo e há seleção, Tab/Enter completa para o comando
-                        # mas Enter sem Tab deve enviar o que está no buffer (ex: /help)
-                        # só auto-completa se buffer ainda é prefixo e não é comando exato
-                        token = buf.split()[0].lower()
-                        names = [m[0].lower() for m in matches]
-                        if token not in names:
-                            # completa para o selecionado
-                            buf = matches[selected][0] + (buf[len(token):] if len(buf) > len(token) else "")
-                            _redraw()
-                            continue
-                # limpa box antes de sair (sem apagar acima)
+                        # se buf tem subcomando, completa subcomando; senão comando
+                        # só auto-completa se ainda é prefixo
+                        if " " in buf:
+                            # subcomando: completa último token
+                            parts = buf.rsplit(None, 1)
+                            prefix = parts[0] + " " if len(parts) > 1 else buf
+                            # para /team com vírgulas, trata diferente
+                            if "," in buf and buf.strip().startswith("/team"):
+                                # completa último nome após vírgula
+                                before_comma = buf.rsplit(",", 1)[0] + "," if "," in buf else ""
+                                last_token = buf.split(",")[-1].strip().split()[0] if "," in buf else buf.split()[-1]
+                                sel = matches[selected][0]
+                                if last_token.lower() not in [m[0].lower() for m in matches]:
+                                    # substitui último token
+                                    if "," in buf:
+                                        base = buf.rsplit(",", 1)[0] + ","
+                                        buf = base + sel + (buf[len(buf.rstrip()):] if buf.endswith(" ") else "")
+                                    else:
+                                        buf = prefix + sel
+                                    _redraw()
+                                    continue
+                            else:
+                                last = buf.split()[-1].lower()
+                                names = [m[0].lower() for m in matches]
+                                if last not in names:
+                                    buf = prefix + matches[selected][0]
+                                    _redraw()
+                                    continue
+                        else:
+                            token = buf.split()[0].lower()
+                            names = [m[0].lower() for m in matches]
+                            if token not in names:
+                                buf = matches[selected][0] + (buf[len(token):] if len(buf) > len(token) else "")
+                                _redraw()
+                                continue
+                # limpa box abaixo antes de sair (preserva acima)
                 if prev_box_lines:
-                    sys.stdout.write(f"\x1b[{prev_box_lines + prev_prompt_lines}A\x1b[J")
-                    sys.stdout.write(visible_prompt + buf + "\r\n")
-                    sys.stdout.flush()
-                else:
-                    sys.stdout.write("\r\n")
-                    sys.stdout.flush()
+                    sys.stdout.write("\x1b[J")
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
                 return buf
             # Tab -> completa
             if ch == "\t":
                 if buf.startswith("/"):
-                    matches = _inline_matches(buf.split()[0])
+                    matches = _inline_matches(buf)
                     if matches:
-                        token = buf.split()[0]
-                        sel_name = matches[selected][0]
-                        # substitui token pelo nome completo
-                        rest = buf[len(token):]
-                        buf = sel_name + rest
+                        # Tab completa subcomando se já tem espaço, senão comando
+                        if " " in buf:
+                            # subcomando
+                            if "," in buf and buf.strip().startswith("/team"):
+                                # team: completa após última vírgula
+                                base = buf.rsplit(",", 1)[0] + "," if "," in buf else ""
+                                # extrai último token parcial
+                                last_part = buf.split(",")[-1]
+                                # remove leading space
+                                prefix_spaces = len(last_part) - len(last_part.lstrip())
+                                last_token = last_part.strip().split()[0] if last_part.strip() else ""
+                                sel = matches[selected][0]
+                                if "," in buf:
+                                    buf = buf.rsplit(",", 1)[0] + "," + " " * (1 if prefix_spaces==0 else 0) + sel
+                                else:
+                                    buf = buf.rsplit(None, 1)[0] + " " + sel if " " in buf else sel
+                            else:
+                                # geral: substitui último token
+                                prefix = buf.rsplit(None, 1)[0] + " " if " " in buf.strip() else ""
+                                # Se buf termina com espaço, adiciona seleção
+                                if buf.endswith(" ") or buf.endswith(","):
+                                    buf = buf + matches[selected][0]
+                                else:
+                                    # substitui último token
+                                    parts = buf.rsplit(None, 1)
+                                    if len(parts) > 1:
+                                        buf = parts[0] + " " + matches[selected][0]
+                                    else:
+                                        buf = matches[selected][0]
+                        else:
+                            token = buf.split()[0]
+                            sel_name = matches[selected][0]
+                            rest = buf[len(token):]
+                            buf = sel_name + rest
                         selected = 0
                         _redraw()
                 continue
@@ -5046,15 +5516,17 @@ def _input_with_inline_autocomplete(prompt, c):
                         break
                     seq += nxt
                 if seq == "[A":  # ↑
-                    if buf.startswith("/") and _inline_matches(buf.split()[0]):
-                        matches = _inline_matches(buf.split()[0])
-                        selected = (selected - 1) % len(matches)
-                        _redraw()
+                    if buf.startswith("/"):
+                        matches = _inline_matches(buf)
+                        if matches:
+                            selected = (selected - 1) % len(matches)
+                            _redraw()
                 elif seq == "[B":  # ↓
-                    if buf.startswith("/") and _inline_matches(buf.split()[0]):
-                        matches = _inline_matches(buf.split()[0])
-                        selected = (selected + 1) % len(matches)
-                        _redraw()
+                    if buf.startswith("/"):
+                        matches = _inline_matches(buf)
+                        if matches:
+                            selected = (selected + 1) % len(matches)
+                            _redraw()
                 elif seq == "":
                     # Esc sozinho -> limpa box / cancela autocomplete
                     if prev_box_lines:
@@ -5088,11 +5560,10 @@ def _input_with_inline_autocomplete(prompt, c):
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         except Exception:
             pass
-        # garante limpeza do box ao sair (sem apagar conversa acima)
+                # garante limpeza do box abaixo ao sair (preserva acima)
         if prev_box_lines:
             try:
-                sys.stdout.write(f"\x1b[{prev_box_lines + prev_prompt_lines}A\x1b[J")
-                sys.stdout.write(visible_prompt + buf)
+                sys.stdout.write("\x1b[J")
                 sys.stdout.flush()
             except Exception:
                 pass
@@ -5273,6 +5744,14 @@ def repl(sess, c, tools_enabled):
         except Exception:
             pass
     run_hooks("SessionEnd", c, sess.cfg)
+    # limpa worktree isolado se criou (grátis)
+    try:
+        if '_wt_path' in locals() and _wt_path:
+            import os as _os_wt
+            _os_wt.chdir(_orig_cwd)
+            _worktree_remove(_wt_path, c)
+    except Exception:
+        pass
     return 0
 
 
