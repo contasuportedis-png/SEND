@@ -22,17 +22,19 @@ echo "== 2. Versão =="
 python3 send.py --version
 
 echo "== 3. Mock do LM Studio =="
+MOCK_PORT="${SEND_MOCK_PORT:-1234}"
 MOCK_PID=""
-if curl -s --max-time 1 http://127.0.0.1:1234/v1/models 2>/dev/null | grep -q '"qwen2.5-coder-7b"'; then
-  echo "Mock já ativo na porta 1234 — reutilizando"
+if curl -s --max-time 1 http://127.0.0.1:${MOCK_PORT}/v1/models 2>/dev/null | grep -q '"qwen2.5-coder-7b"'; then
+  echo "Mock já ativo na porta ${MOCK_PORT} — reutilizando"
 else
-  python3 tests/mock_lmstudio.py &
+  SEND_MOCK_PORT=${MOCK_PORT} python3 tests/mock_lmstudio.py &
   MOCK_PID=$!
   sleep 1
 fi
 trap 'if [ -n "$MOCK_PID" ]; then kill $MOCK_PID 2>/dev/null || true; fi' EXIT
 
 export SEND_HOME="$(mktemp -d)"
+export SEND_BASE_URL="http://127.0.0.1:${MOCK_PORT}"
 
 echo "== 4. --doctor =="
 python3 send.py --doctor

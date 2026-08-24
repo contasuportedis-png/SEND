@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.14.0"
+VERSION = "1.15.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -2911,12 +2911,44 @@ def tool_read(args, c):
         return f"(Arquivo binário com {len(data)} bytes — conteúdo não exibido)"
 
 
+def _is_safe_path(path: Path) -> tuple[bool, str]:
+    """Verifica se o caminho está dentro do projeto ou áreas seguras."""
+    try:
+        # Resolve symlinks
+        resolved = path.resolve()
+        cwd = Path.cwd().resolve()
+        home = Path.home().resolve()
+        # Allow inside cwd, home/.send, and /tmp (for tests)
+        # For security, warn if outside cwd and outside safe areas
+        safe_roots = [cwd, home / ".send", Path("/tmp")]
+        for root in safe_roots:
+            try:
+                resolved.relative_to(root)
+                return True, ""
+            except ValueError:
+                continue
+        # Also allow inside home (user might want to write to ~/Documents)
+        try:
+            resolved.relative_to(home)
+            return True, ""
+        except ValueError:
+            pass
+        return False, f"caminho fora do projeto ({resolved} não está em {cwd})"
+    except Exception as e:
+        return False, str(e)
+
 def tool_write(args, c):
     p = Path(args.get("path", "")).expanduser()
     if not p.is_absolute():
         p = Path.cwd() / p
     p = p.resolve()
     content = args.get("content", "")
+    # Security: check path traversal
+    is_safe, reason = _is_safe_path(p)
+    if not is_safe:
+        # For now, just warn but allow - in strict mode could block
+        # We log a warning for the model
+        print(c.yellow(f"  ⚠ Aviso de segurança: {reason}"))
     backup_file(p)  # cópia de segurança antes de sobrescrever
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
@@ -3106,6 +3138,10 @@ def tool_edit(args, c):
         return f"Erro: arquivo não encontrado: {p}"
     if not p.is_file():
         return f"Erro: '{p}' não é um arquivo."
+    # Security: check path traversal for edit as well
+    is_safe, reason = _is_safe_path(p)
+    if not is_safe:
+        print(c.yellow(f"  ⚠ Aviso de segurança: {reason}"))
     old = args.get("old_text", "")
     new = args.get("new_text", "")
     if not old:
@@ -3197,7 +3233,38 @@ class _TextExtractor(html.parser.HTMLParser):
         return self.text()
 
 
+def _is_private_host(host: str) -> bool:
+    """Verifica se o host é privado/local (SSRF)."""
+    host = host.lower().strip()
+    # Remove port
+    if ":" in host:
+        host = host.split(":")[0]
+    # Check for private IPs and localhost
+    private_patterns = [
+        r"^127\.", r"^10\.", r"^192\.168\.", r"^172\.(1[6-9]|2[0-9]|3[0-1])\.",
+        r"^169\.254\.", r"^0\.0\.0\.0", r"^localhost$", r"^\[::1\]$", r"^::1$"
+    ]
+    for pat in private_patterns:
+        if re.match(pat, host):
+            return True
+    return False
+
 def _http_get(url, timeout=20):
+    # SSRF protection: block private hosts unless explicitly allowed
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        if _is_private_host(host):
+            # Allow 127.0.0.1 for LM Studio/Ollama (local AI) - check if it's in allowed list
+            # For fetch_url (internet skill), block private; for LM Studio, it's ok
+            # We check if the URL is for a local AI service (port 1234 or 11434)
+            port = parsed.port
+            if port not in (1234, 11434):
+                raise ValueError(f"SSRF bloqueado: host privado '{host}' não permitido para fetch_url")
+    except ValueError:
+        raise
+    except Exception:
+        pass
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     return urllib.request.urlopen(req, timeout=timeout)
 
