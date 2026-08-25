@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.15.0"
+VERSION = "1.15.1"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -2878,6 +2878,162 @@ TOOLS = [
         },
         "skill": "pc",
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_directory",
+            "description": "Cria um diretório (e pais se necessário).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Caminho do diretório a criar."}
+                },
+                "required": ["path"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": "Move ou renomeia um arquivo/diretório.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Caminho de origem."},
+                    "destination": {"type": "string", "description": "Caminho de destino."}
+                },
+                "required": ["source", "destination"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "copy_file",
+            "description": "Copia um arquivo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "Caminho de origem."},
+                    "destination": {"type": "string", "description": "Caminho de destino."}
+                },
+                "required": ["source", "destination"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": "Deleta um arquivo ou diretório (recursivo se diretório). Use com cuidado.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Caminho a deletar."}
+                },
+                "required": ["path"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "file_stats",
+            "description": "Mostra estatísticas de um arquivo/diretório (tamanho, modificado, permissões).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Caminho do arquivo/diretório."}
+                },
+                "required": ["path"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Busca por um padrão regex em arquivos. Retorna arquivos e linhas correspondentes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Padrão regex a buscar."},
+                    "path": {"type": "string", "description": "Diretório onde buscar (padrão: atual)."},
+                    "include": {"type": "string", "description": "Filtro de arquivos (ex: *.py)."}
+                },
+                "required": ["pattern"]
+            }
+        },
+        "skill": "arquivos",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": "Executa um snippet Python e retorna a saída. Útil para cálculos e automação rápida.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Código Python a executar."},
+                    "timeout": {"type": "number", "description": "Timeout segundos (padrão 10)."}
+                },
+                "required": ["code"]
+            }
+        },
+        "skill": "terminal",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_env",
+            "description": "Obtém o valor de uma variável de ambiente.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Nome da variável."}
+                },
+                "required": ["name"]
+            }
+        },
+        "skill": "terminal",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_env",
+            "description": "Define uma variável de ambiente para a sessão.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Nome da variável."},
+                    "value": {"type": "string", "description": "Valor."}
+                },
+                "required": ["name", "value"]
+            }
+        },
+        "skill": "terminal",
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_pdf",
+            "description": "Tenta ler um PDF como texto (se disponível). Fallback para binário.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Caminho do PDF."}
+                },
+                "required": ["path"]
+            }
+        },
+        "skill": "arquivos",
+    },
 ]
 
 def ask_yes_no(c, question, default=False):
@@ -3348,6 +3504,177 @@ def tool_fetch_url(args, c):
         text = text[:TOOL_OUTPUT_LIMIT] + "\n… (texto truncado)"
     return f"Conteúdo de {url}:\n\n{text or '(página sem texto legível)'}"
 
+
+def tool_create_directory(args, c):
+    p = _resolve_path(args.get("path",""))
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+        return f"✅ Diretório criado: {p}"
+    except Exception as e:
+        return f"Erro ao criar diretório: {e}"
+
+def tool_move_file(args, c):
+    src = _resolve_path(args.get("source",""))
+    dst = _resolve_path(args.get("destination",""))
+    if not src.exists():
+        return f"Erro: origem não encontrada: {src}"
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        return f"✅ Movido: {src} -> {dst}"
+    except Exception as e:
+        return f"Erro ao mover: {e}"
+
+def tool_copy_file(args, c):
+    src = _resolve_path(args.get("source",""))
+    dst = _resolve_path(args.get("destination",""))
+    if not src.exists():
+        return f"Erro: origem não encontrada: {src}"
+    if src.is_dir():
+        return f"Erro: '{src}' é diretório, use move_file"
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        return f"✅ Copiado: {src} -> {dst}"
+    except Exception as e:
+        return f"Erro ao copiar: {e}"
+
+def tool_delete_file(args, c):
+    p = _resolve_path(args.get("path",""))
+    if not p.exists():
+        return f"Erro: não encontrado: {p}"
+    try:
+        if p.is_dir():
+            shutil.rmtree(p)
+            return f"✅ Diretório removido: {p}"
+        else:
+            p.unlink()
+            return f"✅ Arquivo removido: {p}"
+    except Exception as e:
+        return f"Erro ao deletar: {e}"
+
+def tool_file_stats(args, c):
+    p = _resolve_path(args.get("path",""))
+    if not p.exists():
+        return f"Erro: não encontrado: {p}"
+    try:
+        st = p.stat()
+        import time as _t2
+        return "\n".join([
+            f"Arquivo: {p}",
+            f"  Tipo: {'diretório' if p.is_dir() else 'arquivo'}",
+            f"  Tamanho: {st.st_size} bytes",
+            f"  Modificado: {_t2.ctime(st.st_mtime)}",
+            f"  Permissões: {oct(st.st_mode)[-3:]}",
+            f"  Criado: {_t2.ctime(st.st_ctime)}",
+        ])
+    except Exception as e:
+        return f"Erro: {e}"
+
+def tool_grep(args, c):
+    pattern = args.get("pattern","")
+    if not pattern:
+        return "Erro: pattern vazio"
+    base = _resolve_path(args.get("path","."))
+    include = args.get("include","")
+    if not base.exists() or not base.is_dir():
+        return f"Erro: diretório não encontrado: {base}"
+    try:
+        import re as _re2
+        prog = _re2.compile(pattern)
+    except Exception as e:
+        return f"Erro: regex inválida: {e}"
+    matches = []
+    try:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS]
+            for f in files:
+                if include and not __import__("fnmatch").fnmatch(f, include):
+                    continue
+                fp = Path(root) / f
+                try:
+                    text = fp.read_text(encoding="utf-8", errors="ignore")
+                except:
+                    continue
+                for i, line in enumerate(text.splitlines(), 1):
+                    if prog.search(line):
+                        matches.append(f"{fp}:{i}: {line.strip()[:200]}")
+                        if len(matches) >= 50:
+                            break
+                if len(matches) >= 50:
+                    break
+            if len(matches) >= 50:
+                break
+    except Exception as e:
+        return f"Erro: {e}"
+    if not matches:
+        return f"Nenhum resultado para '{pattern}' em {base}"
+    return "\n".join(matches[:50])
+
+def tool_run_python(args, c):
+    code = args.get("code","")
+    if not code.strip():
+        return "Erro: código vazio"
+    try:
+        timeout = int(args.get("timeout") or 10)
+    except:
+        timeout = 10
+    timeout = max(1, min(timeout, 30))
+    print(c.dim(f"    $ python3 -c ..."))
+    try:
+        proc = subprocess.run(
+            ["python3", "-c", code],
+            capture_output=True, text=True, timeout=timeout, cwd=str(Path.cwd())
+        )
+    except subprocess.TimeoutExpired:
+        return f"Código excedeu {timeout}s"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    if len(out) > TOOL_OUTPUT_LIMIT:
+        out = out[:TOOL_OUTPUT_LIMIT] + "\n… (truncado)"
+    return f"código de saída: {proc.returncode}\n{out}" if out else f"código: {proc.returncode}"
+
+def tool_get_env(args, c):
+    name = args.get("name","").strip()
+    if not name:
+        return "Erro: nome vazio"
+    val = os.environ.get(name, "")
+    if val == "":
+        return f"{name} não definida ou vazia"
+    return f"{name}={val}"
+
+def tool_set_env(args, c):
+    name = args.get("name","").strip()
+    value = args.get("value","")
+    if not name:
+        return "Erro: nome vazio"
+    os.environ[name] = str(value)
+    return f"✅ {name}={value} (sessão atual)"
+
+def tool_read_pdf(args, c):
+    p = _resolve_path(args.get("path",""))
+    if not p.exists():
+        return f"Erro: não encontrado: {p}"
+    if p.suffix.lower() != ".pdf":
+        return f"Aviso: {p} não parece PDF, tentando ler como texto"
+    try:
+        # Tenta usar pypdf se disponível, senão fallback
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(str(p))
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            if text.strip():
+                if len(text) > TOOL_OUTPUT_LIMIT:
+                    text = text[:TOOL_OUTPUT_LIMIT] + "\n… (truncado)"
+                return f"PDF {p} ({len(reader.pages)} páginas):\n\n{text[:4000]}"
+        except ImportError:
+            pass
+        # Fallback: tenta ler como texto/binary
+        data = p.read_bytes()
+        if len(data) > MAX_READ_BYTES:
+            return f"PDF muito grande ({len(data)} bytes)"
+        return f"PDF {p} ({len(data)} bytes) - instale PyPDF2 para extrair texto: pip install PyPDF2"
+    except Exception as e:
+        return f"Erro ao ler PDF: {e}"
 
 def tool_system_info(args, c):
     lines = [
