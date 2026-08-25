@@ -9,7 +9,7 @@ Digite `send` no terminal e comece a conversar:
 
 ```bash
 $ send
-⚡ SEND v1.12.0 — assistente de IA no terminal (local ou na nuvem)
+⚡ SEND v1.16.0 — assistente de IA no terminal (local ou na nuvem)
 
 send(qwen2.5-coder-7b·CODING) ❯ crie um script que renomeie todos os arquivos .txt para .md
 ```
@@ -76,20 +76,34 @@ pedir). Abra um **novo terminal** e use `send --doctor` e depois `send`.
 > com o servidor local ligado (ou o **Ollama** rodando — o SEND detecta
 > automaticamente os dois).
 
-## 🎨 Interface
+## 📱 SEND App — interface gráfica cross-platform
 
-O SEND é todo desenhado para o terminal:
+Digite `/app` dentro do SEND e ele abre uma **interface gráfica completa no navegador** — funciona em **Windows, Linux (Pop!_OS) e Mac**, sem instalar nada (só o navegador):
 
-- **Banner de boas-vindas** com o logo em arte ASCII com gradiente de cores
-- **Respostas formatadas**: títulos em destaque, `negrito`, `código` colorido,
-  listas com marcadores e blocos de código destacados (markdown colorido)
-- **Blocos de código em moldura** com o nome da linguagem: `┌─ python ────┐`
-- **Painéis com bordas** para status, configuração, memória, backups,
-  diagnóstico e as 4 etapas do workflow
-- **Ferramentas com ícones** (📄 ler, ✏️ editar, 🌐 internet, 🌿 git, 🧠 memória…)
-- **Spinner de carregamento** enquanto o modelo pensa
-- **Separadores** entre as respostas + estatísticas (⏱ tempo · tokens)
-- Prompt com **ícone do modo** (🛠 coding · 💬 chat · 📋 plan · 🔁 workflow)
+```
+send        # terminal normal
+/app        # abre http://127.0.0.1:8765 no navegador
+```
+
+- **Sidebar** com todas as Skills, Comandos e Providers clicáveis
+- **Autocomplete dinâmico**: 34 comandos + fuzzy + subcomandos (`/provider` sugere providers reais)
+- **Chat com IA** local ou nuvem, streaming, indicador animado
+- **Quick actions**: /code, /chat, /plan, /workflow, /team, /memoria
+- Código renderizado, histórico local com ↑↓
+- Tema escuro moderno com acento ciano→roxo
+
+Opções: `/app --port 8765 --no-browser` (porta customizada, não abre navegador).
+
+## 🎨 Interface do terminal
+
+- **Banner ASCII** com gradiente ciano→magenta + chips `[v1.16.0] [modelo] [modo]`
+- **Markdown real**: h1 `▐ CAIXA-ALTA` ciano · h2 `▎Subtítulo` magenta · código inline com fundo sutil
+- **Blocos de código arredondados** com chip `[python]]` colorido por linguagem e trilho lateral
+- **Prompt com chip por modo**: 🛠 coding · 💬 chat · 📋 plano · 🔁 workflow (cores fixas)
+- **Tool calls com duração**: `╰─ ✓ 0.8s primeira linha`
+- **Workflow com progresso**: `[▰▰▱▱] 2/4`
+- **Spinner com cronômetro** após 5s
+- **Divisor em gradiente de pontos** entre respostas
 
 > Tudo respeita `NO_COLOR` e cai para texto puro fora de terminal interativo.
 
@@ -152,10 +166,42 @@ model gpt-5              # troca diretamente pelo ID
 
 > Se o provider já tem API key salva (`/provider nvidia` já configurado), o SEND mostra um menu: `1. Reescrever API key / 2. Excluir configuração / 3. Sair`.
 
+### 🔐 Keyring opcional e política de comandos
+
+- `/config use_keyring true` → guarda as API keys no **keyring do sistema** (o config.json guarda só o marcador `__keyring__`). O config.json recebe `chmod 600` automaticamente.
+- `/config command_deny ["git push.*"]` → bloqueia comandos que casarem com o regex.
+- `/config command_allow ["echo .*","ls .*"]` → se não-vazio, **só** esses comandos passam.
+
+### 🤖 /agentes — modelo por modo
+
+Defina qual modelo cada modo usa — o SEND troca **sozinho** quando você alterna `/code`, `/chat`, `/plan` ou liga thinking:
+
+```
+/agentes                              # mostra a tabela atual
+/agentes codigo qwen2.5-coder-7b      # coding usa esse modelo
+/agentes chat gemma-3-4b              # chat usa outro
+/agentes plano llama3.1               # plan usa outro
+/agentes pensamento deepseek-r1       # usado quando --thinking on
+/agentes codigo auto                  # volta ao modelo global
+```
+
+Só lista modelos dos providers que você já conectou. Prioridade: `pensamento` (thinking on) > modo atual > modelo global.
+
+### 🔁 Retry/backoff automático
+
+Erros HTTP 429/5xx ou queda de rede são retentados até 3 vezes com espera crescente (500ms → 1s → 2s) antes de mostrar erro. Configure com `/config api_max_retries N`.
+
+### ↩ Retomar sessão
+
+```bash
+send --continue    # ou -C: retoma a conversa salva mais recente
+
 ### Paleta e autocomplete de comandos
 
 Digite `/` e a **mini barra inline** aparece **abaixo do prompt** (tipo Claude Code) — continue digitando para filtrar (`/p` sugere `/provider`; `/m` sugere `/model`) sem sair da linha e sem apagar o histórico acima. Ela mostra até 6 sugestões por vez com `··· X abaixo/acima` e `✅` nos providers conectados, `↑/↓` navega, `Tab` completa, `Enter` seleciona. Subcomandos também funcionam: `/provider ` lista providers (`auto`, `openai`... com host e modelo), `/model ` lista modelos do provider atual (com cache), `/skills `, `/config `, `/team ` etc.
 `/help` exibe a lista completa com uma descrição breve de cada comando.
+
+**Extras da linha de digitação:** **Ctrl+R** busca no histórico das suas mensagens dentro da linha (↑↓ navega, Enter usa, Esc cancela); atalhos **1–6** pulam direto para uma sugestão; busca **fuzzy** (`/prv` já acha `/provider`).
 
 ## 🔄 Backend automático: LM Studio **ou** Ollama
 
@@ -419,8 +465,8 @@ com `/skills`:
 
 | Skill | O que faz | Ferramentas |
 |---|---|---|
-| **arquivos** | Lê, escreve, **edita**, lista e **procura** arquivos no PC | `read_file`, `write_file`, `edit_file`, `list_files`, `find_files` |
-| **terminal** | Executa comandos no seu terminal | `run_command` |
+| **arquivos** | Lê, escreve, **edita**, lista, procura, cria/move/copiar/deleta arquivos, stats, grep em conteúdo e lê PDFs | `read_file`, `write_file`, `edit_file`, `list_files`, `find_files`, `create_directory`, `move_file`, `copy_file`, `delete_file`, `file_stats`, `grep`, `read_pdf` |
+| **terminal** | Executa comandos, snippets Python e gerencia variáveis de ambiente da sessão | `run_command`, `run_python`, `get_env`, `set_env` |
 | **internet** | **Pesquisa na web** e lê o conteúdo de páginas | `web_search`, `fetch_url` |
 | **pc** | **Abre arquivos e links** no sistema, **navega no browser** e mostra **informações do PC** | `open_file`, `open_url`, `browser_open`, `system_info` |
 | **git** | Opera repositórios git | `git_status`, `git_log`, `git_diff`, `git_commit` |
@@ -537,6 +583,8 @@ send "procure o arquivo config.py"              # skill arquivos
 send "crie uma skill para revisar meu código"   # cria skill personalizada
 send "delegue a revisão do código ao subagente revisor"   # delega a um subagente
 send "/team revisor,pesquisador crie uma API de tarefas"  # equipe de 2+ IAs em paralelo
+send --continue                         # retoma a última conversa salva
+send /app                               # abre a interface gráfica no navegador
 send --models                           # lista os modelos do LM Studio
 send --doctor                           # diagnostica a instalação
 send --update                           # atualiza para a versão mais recente
@@ -558,7 +606,8 @@ autocompletar comandos.
 /automode [on|off]   /outmode [on|off]
 /status   /config [chave] [valor]   /save [arquivo]  /load arquivo
 /backups [restore n]   /contexto [on|off]   /subagentes [nome] [tarefa]   /team <agentes> <tarefa>
-/worktree [on|off]   /mcp [nome|reload]   /hooks   /update   /doctor
+/worktree [on|off]   /agentes [modo] [modelo]   /app [--port N] [--no-browser]
+/mcp [nome|reload]   /hooks   /update   /doctor
 ```
 
 ---
@@ -572,7 +621,9 @@ autocompletar comandos.
 - Em **modo coding** usa *function calling*: lê/escreve arquivos, lista pastas e
   roda comandos (sempre perguntando antes de escrever/executar, a menos que você
   use `-y`).
-- Configuração e histórico ficam em `~/.send/` (`config.json`, `history.jsonl`).
+- Configuração e histórico ficam em `~/.send/` (`config.json` com permissão `600`, `history.jsonl`).
+- `/app` serve uma interface gráfica local via HTTP (`127.0.0.1`) — sem npm/Electron.
+- Segurança: scan local antes de executar comandos, bloqueio SSRF em fetch_url, aviso de caminho fora do projeto, allowlist/denylist de comandos.
 - Suporta também qualquer servidor compatível com a API da OpenAI: basta trocar
   `--base-url` (e `--api-key` via `SEND_API_KEY`, se precisar).
 
