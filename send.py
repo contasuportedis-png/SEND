@@ -53,7 +53,7 @@ try:  # Windows: console em UTF-8
 except Exception:  # pragma: no cover
     pass
 
-VERSION = "1.15.1"
+VERSION = "1.16.0"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234"
 OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -4836,6 +4836,7 @@ COMMANDS = [
     ("/subagentes", "/subagentes [nome] [tarefa]", "Lista os subagentes ou roda um (ex.: /subagentes revisor revise este código)", "sistema"),
     ("/team", "/team <agentes> <tarefa>", "Equipe de 2+ IAs colaborando (ex.: /team revisor,pesquisador crie uma API) — pode usar 'nome@model' para modelos diferentes", "sistema"),
     ("/worktree", "/worktree [on|off]", "Worktree isolado por sessão (git worktree) - cada sessão em branch separado", "sistema"),
+    ("/app", "/app [--port 8765] [--no-browser]", "Abre o SEND App (interface gráfica cross-platform Windows/Linux/Mac)", "sistema"),
     ("/mcp", "/mcp [nome|reload]", "Mostra os servidores MCP (ferramentas externas) e reconecta", "sistema"),
     ("/hooks", "/hooks", "Mostra os hooks configurados (~/.send/hooks.json)", "sistema"),
     ("/doctor", "/doctor", "Diagnostica a instalação e a conexão com o servidor", "sistema"),
@@ -5992,6 +5993,8 @@ def handle_command(sess, line, c, tools_enabled):
         else:
             print(f"🌿 Worktree: {'ligado' if sess.cfg.get('worktree') else 'desligado'} (use /worktree on|off)")
         return False, tools_enabled
+    if cmd == "/app":
+        return cmd_app(sess, rest, c, tools_enabled)
     if cmd == "/mcp":
         return cmd_mcp(sess, rest, c, tools_enabled)
     if cmd == "/hooks":
@@ -7316,6 +7319,372 @@ def main(argv=None):
                         getattr(sess, "auto_confirm", cfg["auto_confirm"]))
 
     return repl(sess, c, tools_enabled)
+
+
+
+# ---------------------------------------------------------------------------
+# App Web - Interface gráfica cross-platform (Windows, Linux, Mac)
+# ---------------------------------------------------------------------------
+
+APP_HTML = r"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⚡ SEND App</title>
+<style>
+:root{
+  --bg:#0b0e14;--bg2:#11151f;--bg3:#161b28;--border:#232a3a;
+  --text:#e2e8f0;--dim:#7c8aa5;--accent:#38bdf8;--accent2:#c084fc;
+  --ok:#34d399;--warn:#fbbf24;--err:#f87171;--userbg:#1e293b;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
+#sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;transition:margin .3s}
+#sidebar.hidden{margin-left:-280px}
+.sidebar-header{padding:16px;border-bottom:1px solid var(--border)}
+.sidebar-header h3{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--accent)}
+.sidebar-section{flex:1;overflow-y:auto;padding:8px}
+.sidebar-section::-webkit-scrollbar{width:6px}
+.sidebar-section::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.sec-title{font-size:11px;text-transform:uppercase;color:var(--dim);padding:12px 8px 4px;letter-spacing:.5px}
+.sk-item{display:flex;align-items:center;gap:10px;padding:8px 10px;margin:2px 0;border-radius:8px;cursor:pointer;font-size:13px}
+.sk-item:hover{background:var(--bg3)}
+.sk-item .ico{font-size:16px;width:22px;text-align:center}
+.sk-item small{color:var(--dim);display:block;font-size:11px}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 18px;display:flex;align-items:center;gap:14px}
+#menu-btn{background:none;border:none;color:var(--text);font-size:20px;cursor:pointer;padding:4px 8px;border-radius:6px}
+#menu-btn:hover{background:var(--bg3)}
+header h1{font-size:16px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700}
+.chips{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
+.chip{font-size:11px;padding:4px 10px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--dim)}
+.chip b{color:var(--accent)}
+.chip.mode-coding b{color:var(--accent)}.chip.mode-chat b{color:#60a5fa}.chip.mode-plan b{color:var(--accent2)}.chip.mode-workflow b{color:#f472b6}
+#chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:16px}
+#chat::-webkit-scrollbar{width:8px}#chat::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+.msg{max-width:85%;padding:14px 18px;border-radius:16px;line-height:1.6;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
+.msg.user{align-self:flex-end;background:linear-gradient(135deg,#1e40af,#3b82f6);border-bottom-right-radius:4px}
+.msg.assistant{align-self:flex-start;background:var(--bg3);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg.system{align-self:center;background:transparent;color:var(--dim);font-size:12px;padding:4px}
+.msg pre{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px;margin:10px 0;overflow-x:auto;font-family:'Consolas','Monaco',monospace;font-size:13px}
+.msg code{background:#0d1117;padding:2px 7px;border-radius:5px;font-family:monospace;font-size:90%;color:var(--accent)}
+.tool-call{background:#0d1520;border-left:3px solid var(--accent);padding:8px 12px;margin:8px 0;border-radius:0 8px 8px 0;font-size:12px;color:var(--dim)}
+.typing{display:inline-flex;gap:4px;padding:12px 18px}
+.typing span{width:8px;height:8px;background:var(--dim);border-radius:50%;animation:bounce 1.2s infinite}
+.typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-8px)}}
+.input-wrap{padding:14px 20px;background:var(--bg2);border-top:1px solid var(--border)}
+.autocomplete{position:absolute;bottom:100%;left:0;right:0;background:var(--bg3);border:1px solid var(--border);border-radius:12px;max-height:260px;overflow-y:auto;display:none;margin-bottom:8px;box-shadow:0 -8px 24px rgba(0,0,0,.4)}
+.autocomplete.show{display:block}
+.ac-head{padding:8px 14px;font-size:11px;color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--border)}
+.ac-item{padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1a2030}
+.ac-item:last-child{border:none}
+.ac-item:hover,.ac-item.sel{background:#1e293b}
+.ac-item b{color:var(--accent);font-weight:600}
+.ac-item small{color:var(--dim);margin-left:auto;padding-left:12px;font-size:11px;text-align:right}
+.input-row{display:flex;gap:10px;position:relative;align-items:flex-end}
+#input{flex:1;background:var(--bg);border:2px solid var(--border);color:var(--text);padding:14px 18px;border-radius:14px;font-size:14px;outline:none;resize:none;transition:border .2s}
+#input:focus{border-color:var(--accent)}
+#send-btn{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff;width:48px;height:48px;border-radius:14px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:transform .15s}
+#send-btn:hover{transform:scale(1.08)}
+#send-btn:disabled{opacity:.5;cursor:wait}
+.quick-row{display:flex;gap:6px;padding:0 20px 8px;flex-wrap:wrap}
+.quick{font-size:11px;padding:5px 12px;border-radius:16px;background:var(--bg3);border:1px solid var(--border);color:var(--dim);cursor:pointer;transition:all .15s}
+.quick:hover{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div class="sidebar-header"><h3>⚡ SEND</h3></div>
+  <div class="sidebar-section">
+    <div class="sec-title">⚡ Comandos</div><div id="cmds"></div>
+    <div class="sec-title">🧰 Skills</div><div id="skills"></div>
+    <div class="sec-title">🔌 Providers</div><div id="providers"></div>
+  </div>
+</div>
+<div class="main">
+  <header>
+    <button id="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('hidden')">☰</button>
+    <h1>SEND App</h1>
+    <div class="chips" id="chips"></div>
+  </header>
+  <div id="chat"></div>
+  <div class="quick-row" id="quick"></div>
+  <div class="input-wrap">
+    <div style="position:relative">
+      <div id="autocomplete" class="autocomplete"><div class="ac-head">Comandos — ↑↓ navega · Tab completa · Enter envia</div><div id="ac-list"></div></div>
+      <div class="input-row">
+        <textarea id="input" rows="1" placeholder="Mensagem ou / comando... (Ctrl+R histórico)"></textarea>
+        <button id="send-btn" onclick="sendMessage()">➤</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const input=document.getElementById('input'),chat=document.getElementById('chat'),
+      acEl=document.getElementById('autocomplete'),acList=document.getElementById('ac-list');
+let commands=[],skills=[],providers=[],selIdx=0,curMatches=[],busy=false,hist=[],histPos=-1;
+
+function api(path,body){
+  return fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}).then(r=>r.json());
+}
+function refresh(){
+  api('/api/status').then(d=>{
+    document.getElementById('chips').innerHTML=
+      `<span class="chip mode-${d.mode}">${d.provider.split('(')[0].trim()} · <b>${d.model}</b> · ${d.mode}</span>`;
+  }).catch(()=>{});
+  Promise.all([api('/api/commands'),api('/api/skills'),api('/api/providers')]).then(([cm,sk,pr])=>{
+    if(Array.isArray(cm)) commands=cm.map(x=>({name:x.name||x[0],desc:x.desc||x[2]||''}));
+    if(Array.isArray(sk)) skills=sk;
+    if(Array.isArray(pr)) providers=pr.map(x=>({id:x.id||x[0],name:x.name||x[1]||''}));
+    renderSidebar();
+  }).catch(()=>{});
+}
+function renderSidebar(){
+  document.getElementById('cmds').innerHTML=commands.slice(0,20).map(c=>
+    `<div class="sk-item" onclick="useCmd('${c.name}')"><span class="ico">⚡</span><div>${c.name}<small>${c.desc||''}</small></div></div>`).join('');
+  const skIcons={arquivos:'📁',terminal:'💻',internet:'🌐',pc:'🖥️',git:'🌿',processos:'⚙️',memoria:'🧠',subagentes:'🤝'};
+  document.getElementById('skills').innerHTML=(Array.isArray(skills)?skills:[]).map(s=>{
+    const n=s.name||s.id||String(s), d=s.description||s.desc||s[1]||'';
+    return `<div class="sk-item" onclick="input.value='${n} '; input.focus()"><span class="ico">${skIcons[n]||'⭐'}</span><div>${n}<small>${d}</small></div></div>`;
+  }).join('') || '<div class="sk-item"><small>carregando…</small></div>';
+  document.getElementById('providers').innerHTML=(Array.isArray(providers)?providers:[]).slice(0,10).map(p=>
+    `<div class="sk-item" onclick="useCmd('/provider ${p.id}')"><span class="ico">🔌</span><div>${p.id}<small>${p.name}</small></div></div>`).join('');
+}
+function useCmd(c){ input.value=c+' '; input.focus(); input.dispatchEvent(new Event('input')); }
+refresh(); setInterval(refresh,15000);
+
+// quick actions
+const quick=[['🛠 /code','/code'],['💬 /chat','/chat'],['📋 /plan','/plan'],['🔁 /workflow','/workflow'],
+  ['🧠 /memoria','/memoria'],['👥 /team','/team '],['🌿 git','git status'],['🔍 buscar','/doctor']];
+document.getElementById('quick').innerHTML=quick.map(q=>`<span class="quick" onclick="useCmd('${q[1]}')">${q[0]}</span>`).join('');
+
+function addMsg(role,content,isHtml){
+  const div=document.createElement('div'); div.className='msg '+role;
+  if(!isHtml){
+    let h=content.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    h=h.replace(/```(\w*)\n([\s\S]*?)```/g,(m,l,c)=>`<pre>${c}</pre>`);
+    h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
+    div.innerHTML=h;
+  } else div.innerHTML=content;
+  chat.appendChild(div); chat.scrollTop=chat.scrollHeight; return div;
+}
+
+function updateAC(matches){
+  curMatches=matches;
+  if(!matches.length){ acEl.classList.remove('show'); return; }
+  acList.innerHTML=matches.slice(0,8).map((m,i)=>
+    `<div class="ac-item ${i===Math.min(selIdx,matches.length-1)?'sel':''}" onmousedown="pickMatch(${i})">
+     <b>${m.name}</b><small>${m.desc||''}</small></div>`).join('');
+  acEl.classList.add('show');
+}
+function pickMatch(i){ selIdx=i; applyMatch(); }
+function applyMatch(){
+  const m=curMatches[Math.min(selIdx,curMatches.length-1)];
+  if(!m) return;
+  const parts=input.value.split(' ');
+  if(input.value.startsWith('/') && !input.value.includes(' ',1)) input.value=m.name+' ';
+  else { parts[parts.length-1]=m.name; input.value=parts.join(' ')+' '; }
+  acEl.classList.remove('show'); input.focus();
+}
+
+input.addEventListener('input',()=>{
+  input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,120)+'px';
+  const v=input.value;
+  if(v.startsWith('/') && !v.includes('\n')){
+    const q=v.toLowerCase();
+    let matches=[];
+    // subcomandos: /provider x -> sugere modelos/providers
+    const sp=v.split(/\s+/);
+    if(sp.length>=2 && sp.length<=2 && v.endsWith(' ')===false && sp[1]){
+      const sub=sp[sp.length-1].toLowerCase();
+      if(['/provider'].includes(sp[0])) matches=providers.filter(p=>p.id.startsWith(sub)||p.name.toLowerCase().includes(sub)).map(p=>({name:p.id,desc:p.name}));
+      else if(['/model','/agentes'].includes(sp[0])) matches=[];
+    }
+    if(!matches.length){
+      matches=commands.filter(cmd=>cmd.name.toLowerCase().startsWith(q)|| (q.length>2&&cmd.desc&&cmd.desc.toLowerCase().includes(q)));
+      // também skills como comandos
+      if(v==='/' ) matches=commands.concat(skills.map(s=>({name:s.name||s,desc:s.description||'skill'})));
+    }
+    selIdx=0; updateAC(matches);
+  } else acEl.classList.remove('show');
+});
+input.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); sendMessage(); return; }
+  if(acEl.classList.contains('show')){
+    if(e.key==='ArrowDown'){ e.preventDefault(); selIdx=Math.min(selIdx+1,curMatches.length-1); updateAC(curMatches); }
+    else if(e.key==='ArrowUp'){ e.preventDefault(); selIdx=Math.max(selIdx-1,0); updateAC(curMatches); }
+    else if(e.key==='Tab'){ e.preventDefault(); applyMatch(); }
+    else if(e.key==='Escape'){ acEl.classList.remove('show'); }
+  } else {
+    // histórico com setas
+    if(e.key==='ArrowUp'&&!input.value){ if(histPos<hist.length-1){histPos++;input.value=hist[hist.length-1-histPos];} e.preventDefault(); }
+    else if(e.key==='ArrowDown'&&histPos>=0){ histPos--; input.value=histPos>=0?hist[hist.length-1-histPos]:''; e.preventDefault(); }
+  }
+});
+
+async function sendMessage(){
+  const text=input.value.trim();
+  if(!text||busy) return;
+  busy=true; document.getElementById('send-btn').disabled=true;
+  addMsg('user',text); hist.push(text); histPos=-1;
+  input.value=''; input.style.height='auto'; acEl.classList.remove('show');
+  const typing=addMsg('assistant','',true);
+  typing.innerHTML='<span class="typing"><span></span><span></span><span></span></span>';
+  try{
+    if(text.startsWith('/')){
+      const d=await api('/api/command',{command:text});
+      typing.remove(); addMsg('assistant',d.result||d.response||d.error||'OK');
+    }else{
+      const d=await api('/api/chat',{message:text});
+      typing.remove();
+      addMsg('assistant',d.response||d.error||'(sem resposta)');
+    }
+  }catch(e){ typing.remove(); addMsg('assistant','Erro: '+e.message); }
+  busy=false; document.getElementById('send-btn').disabled=false;
+  refresh(); input.focus();
+}
+input.focus();
+</script>
+</body>
+</html>
+"""
+
+_app_sess = None
+_app_c = None
+
+def app_server(port=8765, open_browser=True):
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import json as _json
+    global _app_sess, _app_c
+    _app_c = make_colors()
+    cfg = load_config()
+    _app_sess = Session(cfg, _app_c)
+    try:
+        _app_sess.model_id = resolve_model(cfg, _app_c)
+    except Exception:
+        pass
+    ensure_default_subagents()
+    if cfg.get("mcp_enabled", True):
+        try: mcp_start_all(_app_c)
+        except: pass
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args): pass
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.end_headers()
+                self.wfile.write(APP_HTML.encode("utf-8"))
+            elif self.path == "/api/status":
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+                cfg2 = load_config()
+                self.wfile.write(_json.dumps({"provider": provider_spec(cfg2)["name"], "model": _app_sess.model_id or cfg2.get("model") or "auto", "mode": cfg2.get("mode","coding"), "version": VERSION}).encode())
+            elif self.path == "/api/commands":
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+                cmds = [{"name": c[0], "desc": c[2]} for c in COMMANDS]
+                self.wfile.write(_json.dumps(cmds).encode())
+            elif self.path == "/api/skills":
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+                skills_list = [{"name": k, "description": v} for k, v in SKILLS.items()]
+                try:
+                    for cs in load_custom_skills():
+                        skills_list.append({"name": cs["name"], "description": cs.get("description","")})
+                except Exception:
+                    pass
+                self.wfile.write(_json.dumps(skills_list).encode())
+            elif self.path == "/api/providers":
+                self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+                provs = [{"id": pid, "name": spec.get("name", pid)} for pid, spec in PROVIDER_PRESETS.items()]
+                self.wfile.write(_json.dumps(provs).encode())
+            else:
+                self.send_response(404); self.end_headers()
+        def do_POST(self):
+            length=int(self.headers.get("Content-Length",0))
+            body=self.rfile.read(length) if length else b"{}"
+            try: data=_json.loads(body.decode("utf-8") or "{}")
+            except: data={}
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+            try:
+                if self.path == "/api/chat":
+                    msg=data.get("message","")
+                    if not msg:
+                        self.wfile.write(_json.dumps({"error":"mensagem vazia"}).encode()); return
+                    if msg.strip().startswith("/"):
+                        import io as _io2
+                        from contextlib import redirect_stdout
+                        f=_io2.StringIO()
+                        with redirect_stdout(f):
+                            do_exit,_ = handle_command(_app_sess, msg.strip(), _app_c, True)
+                        out=f.getvalue()
+                        self.wfile.write(_json.dumps({"response": out or f"Comando {msg} executado"}).encode()); return
+                    _app_sess.messages.append({"role":"user","content":msg})
+                    try:
+                        content=ask_model(_app_sess, True, _app_c, True)
+                        if content: _app_sess.messages.append({"role":"assistant","content":content})
+                        self.wfile.write(_json.dumps({"response": content or "Sem resposta"}).encode())
+                    except Exception as e:
+                        self.wfile.write(_json.dumps({"error":str(e)}).encode())
+                elif self.path == "/api/command":
+                    cmd=data.get("command","")
+                    import io as _io3
+                    from contextlib import redirect_stdout
+                    f=_io3.StringIO()
+                    with redirect_stdout(f):
+                        do_exit,_ = handle_command(_app_sess, cmd, _app_c, True)
+                    out=f.getvalue()
+                    self.wfile.write(_json.dumps({"result": out or "OK"}).encode())
+                else:
+                    self.wfile.write(_json.dumps({"error":"rota não encontrada"}).encode())
+            except Exception as e:
+                self.wfile.write(_json.dumps({"error":str(e)}).encode())
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+    for try_port in range(port, port+10):
+        try:
+            server=HTTPServer(("127.0.0.1", try_port), Handler)
+            break
+        except OSError:
+            continue
+    else:
+        print(f"✗ Não foi possível iniciar o app em nenhuma porta {port}-{port+10}")
+        return 1
+    url=f"http://127.0.0.1:{try_port}"
+    print(f"✅ SEND App rodando em {url}")
+    print(f"   Funciona em Windows, Linux (Pop!_OS) e Mac - todas as funcionalidades via /comandos")
+    print(f"   Pressione Ctrl+C para parar o app e voltar ao terminal")
+    if open_browser:
+        try:
+            webbrowser.open(url)
+            print(f"   Navegador aberto: {url}")
+        except Exception:
+            print(f"   Abra manualmente: {url}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\\n👋 App encerrado")
+        try: server.shutdown()
+        except: pass
+        return 0
+
+def cmd_app(sess, rest, c, tools_enabled):
+    port=8765
+    open_browser=True
+    if rest:
+        import shlex
+        try:
+            parts=shlex.split(rest)
+            for i,p in enumerate(parts):
+                if p=="--port" and i+1 < len(parts):
+                    port=int(parts[i+1])
+                if p=="--no-browser":
+                    open_browser=False
+        except: pass
+    return app_server(port, open_browser)
 
 
 if __name__ == "__main__":
