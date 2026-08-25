@@ -79,7 +79,9 @@ ALLOWED_ALL = {"read_file","write_file","edit_file","list_files","find_files",
                "run_command","web_search","fetch_url","system_info","open_file",
                "open_url","browser_open","git_status","git_log","git_diff","git_commit",
                "list_processes","kill_process","read_memory","remember",
-               "create_skill","delegate","create_subagent","team"}
+               "create_skill","delegate","create_subagent","team",
+               "create_directory","move_file","copy_file","delete_file",
+               "file_stats","grep","run_python","get_env","set_env","read_pdf"}
 for _t in tools:
     assert _t["function"]["name"] in ALLOWED_ALL, _t["function"]["name"]
 print(f"   {len(tools)} ferramentas válidas OK")
