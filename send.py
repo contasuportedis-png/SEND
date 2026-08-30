@@ -22,10 +22,12 @@ Uso:
 
 import argparse
 import atexit
+import contextlib
 import difflib
 import fnmatch
 import getpass
 import html.parser
+import io
 import json
 import os
 import platform
@@ -151,6 +153,9 @@ SEND_HOME = Path(os.environ.get("SEND_HOME", str(Path.home() / ".send")))
 CONFIG_PATH = SEND_HOME / "config.json"
 HISTORY_PATH = SEND_HOME / "history.jsonl"
 INPUT_HISTORY = SEND_HOME / "input_history"
+SCHEDULES_PATH = SEND_HOME / "schedules.json"
+SCHEDULE_LOG_PATH = SEND_HOME / "schedules.jsonl"
+PROJECT_CONFIG_NAME = ".send.json"
 
 def _read_utf8_event(fd, maxlen=16):
     """Lê UM evento de tecla juntando bytes até formar UTF-8 válido (grátis).
@@ -705,6 +710,8 @@ DEFAULT_CONFIG = {
     "model_by_mode": {},           # ex.: {"codigo":"qwen2.5-coder-7b","chat":"gemma-3-4b"}
     "command_deny": [],            # regex que BLOQUEIA run_command sempre
     "command_allow": [],           # se não-vazio, SÓ estes passam (deny ganha)
+    "tool_deny": [],               # nomes/globs de ferramentas sempre bloqueadas
+    "tool_allow": [],              # se não-vazio, só estas ferramentas executam
     "use_keyring": False,          # guarda api_key no keyring do sistema (se houver)
     "skills_external_dirs": [],    # ex.: ["~/.agents/skills"] — lidas sem copiar
     "security_scan": True,         # scan local antes de executar comandos
@@ -2080,6 +2087,38 @@ def load_config():
     return cfg
 
 
+def load_project_permissions(directory=None):
+    """Lê permissões locais de .send.json, sem persistir nada no perfil global.
+
+    O arquivo é opcional e pode ser versionado junto ao projeto. Só aceita regras
+    de segurança; chaves de provider ou API key são deliberadamente ignoradas.
+    """
+    path = Path(directory or Path.cwd()) / PROJECT_CONFIG_NAME
+    empty = {"path": str(path), "tool_allow": [], "tool_deny": [],
+             "command_allow": [], "command_deny": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return empty
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"⚠ Ignorando {path.name}: configuração inválida ({e})")
+        return empty
+    if not isinstance(data, dict):
+        print(f"⚠ Ignorando {path.name}: o conteúdo deve ser um objeto JSON.")
+        return empty
+    for key in ("tool_allow", "tool_deny", "command_allow", "command_deny"):
+        value = data.get(key, [])
+        if isinstance(value, list) and all(isinstance(item, str) for item in value):
+            empty[key] = value
+    return empty
+
+
+def apply_project_permissions(cfg, directory=None):
+    """Anexa a política local ao cfg da sessão, sem alterar config.json global."""
+    cfg["_project_permissions"] = load_project_permissions(directory)
+    return cfg
+
+
 def save_config(cfg):
     global _CFG_CACHE
     try:
@@ -3093,6 +3132,11 @@ def _is_safe_path(path: Path) -> tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+def _safe_path_error(path: Path) -> str | None:
+    """Retorna erro para caminhos fora das áreas permitidas."""
+    ok, reason = _is_safe_path(path)
+    return None if ok else f"Operação bloqueada por segurança: {reason}"
+
 def tool_write(args, c):
     p = Path(args.get("path", "")).expanduser()
     if not p.is_absolute():
@@ -3102,9 +3146,7 @@ def tool_write(args, c):
     # Security: check path traversal
     is_safe, reason = _is_safe_path(p)
     if not is_safe:
-        # For now, just warn but allow - in strict mode could block
-        # We log a warning for the model
-        print(c.yellow(f"  ⚠ Aviso de segurança: {reason}"))
+        return f"Operação bloqueada por segurança: {reason}"
     backup_file(p)  # cópia de segurança antes de sobrescrever
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
@@ -3151,6 +3193,31 @@ def _security_scan(cmd):
     return issues
 
 
+def _matches_permission(patterns, value):
+    """Compara nomes de ferramentas com suporte a curingas simples (*, ?)."""
+    import fnmatch
+    return any(fnmatch.fnmatchcase(value, pattern) for pattern in patterns if pattern)
+
+
+def tool_permission_error(name, cfg):
+    """Aplica a política global e a política opcional do projeto.
+
+    A regra deny sempre vence. Cada allow não vazia também restringe a chamada,
+    logo uma política de projeto jamais amplia permissões globais existentes.
+    """
+    if not cfg:
+        return None
+    project = cfg.get("_project_permissions", {})
+    denials = list(cfg.get("tool_deny") or []) + list(project.get("tool_deny") or [])
+    if _matches_permission(denials, name):
+        return f"Ferramenta bloqueada pela política de permissões: {name}"
+    allow_lists = [cfg.get("tool_allow") or [], project.get("tool_allow") or []]
+    if any(rules for rules in allow_lists) and any(
+            not _matches_permission(rules, name) for rules in allow_lists if rules):
+        return f"Ferramenta fora da lista permitida: {name}"
+    return None
+
+
 def tool_run(args, c, cfg=None):
     cmd = args.get("command", "")
     try:
@@ -3162,10 +3229,14 @@ def tool_run(args, c, cfg=None):
     if cfg is not None:
         try:
             import re as _re_pol
-            deny = [d for d in (cfg.get("command_deny") or []) if d]
-            allow = [a for a in (cfg.get("command_allow") or []) if a]
+            project = cfg.get("_project_permissions", {})
+            deny = ([d for d in (cfg.get("command_deny") or []) if d] +
+                    [d for d in (project.get("command_deny") or []) if d])
+            allow_lists = [cfg.get("command_allow") or [],
+                           project.get("command_allow") or []]
             denied = any(_re_pol.fullmatch(d, cmd) for d in deny)
-            not_allowed = bool(allow) and not any(_re_pol.fullmatch(a, cmd) for a in allow)
+            not_allowed = any(rules and not any(_re_pol.fullmatch(a, cmd) for a in rules)
+                              for rules in allow_lists)
             if denied or not_allowed:
                 why = "bloqueado por command_deny" if denied else "fora de command_allow"
                 print(c.red(f"    ⛔ {why}: {cmd[:80]}"))
@@ -3266,6 +3337,9 @@ def _dispatch_tool(name, args, c, auto_confirm, cfg=None):
 
 def execute_tool(name, args, c, auto_confirm, cfg=None):
     """Executa uma ferramenta, disparando os hooks PreToolUse/PostToolUse."""
+    denied = tool_permission_error(name, cfg)
+    if denied:
+        return denied
     run_hooks("PreToolUse", c, cfg, tool=name,
               args=json.dumps(args, ensure_ascii=False)[:2000])
     try:
@@ -3518,6 +3592,9 @@ def tool_move_file(args, c):
     dst = _resolve_path(args.get("destination",""))
     if not src.exists():
         return f"Erro: origem não encontrada: {src}"
+    for path in (src, dst):
+        if (err := _safe_path_error(path)):
+            return err
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
@@ -3530,6 +3607,9 @@ def tool_copy_file(args, c):
     dst = _resolve_path(args.get("destination",""))
     if not src.exists():
         return f"Erro: origem não encontrada: {src}"
+    for path in (src, dst):
+        if (err := _safe_path_error(path)):
+            return err
     if src.is_dir():
         return f"Erro: '{src}' é diretório, use move_file"
     try:
@@ -3543,6 +3623,8 @@ def tool_delete_file(args, c):
     p = _resolve_path(args.get("path",""))
     if not p.exists():
         return f"Erro: não encontrado: {p}"
+    if (err := _safe_path_error(p)):
+        return err
     try:
         if p.is_dir():
             shutil.rmtree(p)
@@ -3977,6 +4059,8 @@ class Session:
         self.summary = None   # resumo de conversas anteriores (auto-summarize)
         self.mode_override = None   # modo fixo escolhido pelo usuário
         self.outmode_prev = None    # estado anterior (para /outmode off)
+        self.max_turns = MAX_TOOL_ROUNDS
+        self.turns_used = 0
 
 
 # Limite de mensagens antes de resumir a conversa automaticamente
@@ -4428,7 +4512,8 @@ def run_agent(sess, tools_enabled, c, auto_confirm):
     cfg = sess.cfg
     content = ""
     _guard_history = []  # lista de {name, args, result}
-    for _ in range(MAX_TOOL_ROUNDS):
+    for _ in range(max(1, int(getattr(sess, "max_turns", MAX_TOOL_ROUNDS)) )):
+        sess.turns_used += 1
         content, calls, reasoning = call_model(sess, tools_enabled, c, cfg)
         if reasoning and getattr(sess, "last_reasoning", "") != reasoning:
             sess.last_reasoning = reasoning
@@ -4797,6 +4882,113 @@ def load_session(sess, name):
     return False
 
 
+def search_history(query, limit=20):
+    """Busca local, sem rede, nas conversas persistidas do SEND."""
+    needle = (query or "").strip().lower()
+    if not needle:
+        return []
+    found = []
+    try:
+        with open(HISTORY_PATH, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                content = str(item.get("content") or "")
+                if needle in content.lower():
+                    found.append(item)
+    except FileNotFoundError:
+        pass
+    return found[-max(1, limit):]
+
+
+def load_schedules():
+    try:
+        data = json.loads(SCHEDULES_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def save_schedules(tasks):
+    SEND_HOME.mkdir(parents=True, exist_ok=True)
+    SCHEDULES_PATH.write_text(json.dumps(tasks, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+
+
+def add_schedule(minutes, prompt):
+    minutes = int(minutes)
+    if minutes < 1 or not prompt.strip():
+        raise ValueError("intervalo deve ser maior que zero e a tarefa não pode ser vazia")
+    tasks = load_schedules()
+    now = time.time()
+    task = {
+        "id": f"task-{int(now)}-{len(tasks) + 1}", "prompt": prompt.strip(),
+        "every_minutes": minutes, "next_run": now + minutes * 60,
+        "enabled": True, "last_run": None, "cwd": str(Path.cwd()),
+    }
+    tasks.append(task)
+    save_schedules(tasks)
+    return task
+
+
+def due_schedules(now=None):
+    now = time.time() if now is None else now
+    return [task for task in load_schedules()
+            if task.get("enabled") and float(task.get("next_run", 0)) <= now]
+
+
+def mark_schedule_run(task_id, now=None, result=None):
+    now = time.time() if now is None else now
+    tasks = load_schedules()
+    for task in tasks:
+        if task.get("id") == task_id:
+            task["last_run"] = now
+            task["next_run"] = now + max(1, int(task.get("every_minutes", 1))) * 60
+            break
+    save_schedules(tasks)
+    try:
+        with open(SCHEDULE_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": now, "id": task_id, "result": result or ""},
+                               ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def run_due_schedules(cfg, c, model_id=None):
+    """Executa uma vez as tarefas vencidas; ideal para cron/systemd timer."""
+    due = due_schedules()
+    if not due:
+        print("Nenhuma tarefa agendada vencida.")
+        return 0
+    failures = 0
+    for task in due:
+        print(c.bold(f"⏰ Executando {task['id']}: ") + task["prompt"][:120])
+        original_cwd = Path.cwd()
+        task_cwd = Path(task.get("cwd") or original_cwd)
+        try:
+            if not task_cwd.is_dir():
+                raise FileNotFoundError(f"diretório do projeto não encontrado: {task_cwd}")
+            os.chdir(task_cwd)
+            task_cfg = apply_project_permissions(dict(cfg), task_cwd)
+            task_sess = Session(task_cfg, c)
+            task_sess.model_id = model_id
+            mode, _ = effective_mode(task_sess, task["prompt"])
+            task_sess.mode_override = mode
+            tools_enabled = mode in ("coding", "workflow")
+            code = one_shot(task_sess, task["prompt"], c, tools_enabled,
+                            bool(task_cfg.get("auto_confirm", False)))
+        except Exception as e:
+            print(c.red(f"✗ {e}"))
+            code = 1
+        finally:
+            os.chdir(original_cwd)
+        mark_schedule_run(task["id"], result="ok" if code == 0 else f"exit:{code}")
+        failures += bool(code)
+    return 1 if failures else 0
+
+
 # ---------------------------------------------------------------------------
 # Modo interativo (REPL)
 # ---------------------------------------------------------------------------
@@ -4811,6 +5003,7 @@ COMMANDS = [
     ("/skills", "/skills [nome] [on|off]", "Gerencia as skills (nativas e criadas por você)", "básico"),
     ("/memoria", "/memoria", "Mostra a memória de longo prazo (~/.send/memoria.md)", "básico"),
     ("/resumo", "/resumo", "Resume a conversa atual (economiza contexto)", "básico"),
+    ("/buscar", "/buscar <texto>", "Busca nas conversas salvas", "básico"),
     ("/pensamento", "/pensamento", "Mostra o último pensamento do modelo (expandido)", "básico"),
     ("/clear", "/clear", "Limpa a conversa atual", "básico"),
     ("/exit", "/exit", "Sai do SEND", "básico"),
@@ -4829,8 +5022,10 @@ COMMANDS = [
     ("/tools", "/tools [on|off]", "Liga/desliga as ferramentas manualmente", "modo"),
     ("/status", "/status", "Mostra o estado da sessão", "sessão"),
     ("/config", "/config [chave] [valor]", "Mostra ou altera a configuração", "sessão"),
+    ("/permissions", "/permissions", "Mostra as permissões globais e do projeto", "sessão"),
     ("/save", "/save [arquivo]", "Salva a conversa em ~/.send/sessions/", "sessão"),
     ("/load", "/load arquivo", "Carrega uma conversa salva", "sessão"),
+    ("/agendar", "/agendar [add|minutos|remove]", "Gerencia tarefas agendadas locais", "sessão"),
     ("/backups", "/backups [restore n]", "Lista/restaura backups de arquivos alterados", "sistema"),
     ("/contexto", "/contexto [on|off]", "Liga/desliga o contexto do projeto no prompt", "sistema"),
     ("/subagentes", "/subagentes [nome] [tarefa]", "Lista os subagentes ou roda um (ex.: /subagentes revisor revise este código)", "sistema"),
@@ -5158,6 +5353,7 @@ EDITABLE_CONFIG = {
     "skills_external_dirs": list,
     "api_max_retries": int, "use_keyring": bool,
     "command_deny": list, "command_allow": list,
+    "tool_deny": list, "tool_allow": list,
 }
 
 
@@ -5794,6 +5990,73 @@ def cmd_hooks(sess, rest, c, tools_enabled):
     return False, tools_enabled
 
 
+def cmd_search_history(rest, c, tools_enabled):
+    query = rest.strip()
+    if not query:
+        print("Uso: /buscar <texto>")
+        return False, tools_enabled
+    rows = search_history(query)
+    if not rows:
+        print(c.yellow("Nenhuma conversa encontrada."))
+        return False, tools_enabled
+    lines = []
+    for item in rows:
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("ts", 0)))
+        content = " ".join(str(item.get("content") or "").split())[:220]
+        lines.append(f"{stamp} · {item.get('role', '?')}: {content}")
+    panel(f"🔎 BUSCA ({len(rows)})", "\n".join(lines), c, width=86)
+    return False, tools_enabled
+
+
+def cmd_schedule(rest, c, tools_enabled):
+    """Agenda recorrências locais; execução é disparada por --run-scheduled."""
+    parts = rest.split(None, 2)
+    if not parts:
+        tasks = load_schedules()
+        if not tasks:
+            print("Nenhuma tarefa agendada. Ex.: /agendar add 60 revise o projeto")
+        else:
+            lines = []
+            for task in tasks:
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(task["next_run"]))
+                state = "✅" if task.get("enabled") else "⏸"
+                lines.append(f"{state} {task['id']} · a cada {task['every_minutes']} min · {when}\n"
+                             f"   📂 {task.get('cwd', '(não informado)')}\n"
+                             f"   {task['prompt']}")
+            panel("⏰ TAREFAS AGENDADAS", "\n".join(lines), c, width=86)
+        print(c.dim("Execute periodicamente: send --run-scheduled"))
+        return False, tools_enabled
+    action = parts[0].lower()
+    if action == "add" and len(parts) == 3:
+        try:
+            task = add_schedule(parts[1], parts[2])
+        except ValueError as e:
+            print(c.yellow(f"Erro: {e}"))
+        else:
+            print(c.green(f"✅ Agendada {task['id']} a cada {task['every_minutes']} min."))
+        return False, tools_enabled
+    if action in ("remove", "on", "off") and len(parts) >= 2:
+        task_id = parts[1]
+        tasks = load_schedules()
+        found = False
+        for task in tasks[:]:
+            if task.get("id") != task_id:
+                continue
+            found = True
+            if action == "remove":
+                tasks.remove(task)
+            else:
+                task["enabled"] = action == "on"
+        if found:
+            save_schedules(tasks)
+            print(c.green(f"✅ Tarefa {task_id}: {action}."))
+        else:
+            print(c.yellow(f"Tarefa não encontrada: {task_id}"))
+        return False, tools_enabled
+    print("Uso: /agendar | /agendar add <minutos> <tarefa> | /agendar on|off|remove <id>")
+    return False, tools_enabled
+
+
 def handle_command(sess, line, c, tools_enabled):
     """Processa um comando iniciado com '/'. Retorna (sair?, tools_enabled)."""
     cfg = sess.cfg
@@ -5887,8 +6150,28 @@ def handle_command(sess, line, c, tools_enabled):
             print(c.yellow("Não foi possível resumir agora (conversa curta ou "
                            "erro)."))
         return False, tools_enabled
+    if cmd == "/buscar":
+        return cmd_search_history(rest, c, tools_enabled)
     if cmd == "/config":
         return cmd_config(sess, rest, c, tools_enabled)
+    if cmd == "/permissions":
+        project = cfg.get("_project_permissions", {})
+        lines = [
+            f"Global — tools allow: {cfg.get('tool_allow') or '(todas)'}",
+            f"Global — tools deny : {cfg.get('tool_deny') or '(nenhuma)'}",
+            f"Global — cmds allow : {cfg.get('command_allow') or '(todos)'}",
+            f"Global — cmds deny  : {cfg.get('command_deny') or '(nenhum)'}",
+            "",
+            f"Projeto ({project.get('path', PROJECT_CONFIG_NAME)})",
+            f"Tools allow: {project.get('tool_allow') or '(todas)'}",
+            f"Tools deny : {project.get('tool_deny') or '(nenhuma)'}",
+            f"Cmds allow : {project.get('command_allow') or '(todos)'}",
+            f"Cmds deny  : {project.get('command_deny') or '(nenhum)'}",
+        ]
+        panel("🔐 PERMISSÕES", "\n".join(lines), c, width=78)
+        return False, tools_enabled
+    if cmd == "/agendar":
+        return cmd_schedule(rest, c, tools_enabled)
     if cmd == "/backups":
         return cmd_backups(sess, rest, c, tools_enabled)
     if cmd == "/backend":
@@ -7014,6 +7297,38 @@ def one_shot(sess, prompt, c, tools_enabled, auto_confirm):
     return 0
 
 
+def automation_one_shot(sess, prompt, tools_enabled, auto_confirm, output_format):
+    """Executa uma tarefa sem ruído de terminal para scripts e CI/CD."""
+    captured = io.StringIO()
+    with contextlib.redirect_stdout(captured):
+        code = one_shot(sess, prompt, C(False), tools_enabled, auto_confirm)
+    response = ""
+    for message in reversed(sess.messages):
+        if message.get("role") == "assistant":
+            response = message.get("content") or ""
+            break
+    data = {
+        "type": "result",
+        "status": "success" if code == 0 else "error",
+        "exit_code": code,
+        "response": response,
+        "model": sess.model_id,
+        "turns": sess.turns_used,
+    }
+    diagnostic = captured.getvalue().strip()
+    if code != 0 and diagnostic:
+        data["error"] = diagnostic
+    if output_format == "text":
+        if response:
+            print(response)
+        elif diagnostic:
+            print(diagnostic, file=sys.stderr)
+    else:
+        # stream-json usa NDJSON: cada execução produz um evento final parseável.
+        print(json.dumps(data, ensure_ascii=False))
+    return code
+
+
 def doctor(cfg, c):
     lines = [
         f"Versão   : {VERSION}",
@@ -7159,6 +7474,14 @@ def parse_args(argv=None):
                          "automaticamente (sem perguntar)")
     ap.add_argument("--no-tools", action="store_true",
                     help="desativa as ferramentas nesta sessão")
+    ap.add_argument("--print", dest="print_mode", action="store_true",
+                    help="executa uma tarefa e imprime somente a resposta (ideal para scripts)")
+    ap.add_argument("--output-format", choices=["text", "json", "stream-json"],
+                    default="text", help="formato do --print: text, json ou stream-json")
+    ap.add_argument("--max-turns", type=int, default=None,
+                    help="limita as iterações do agente nesta execução")
+    ap.add_argument("--run-scheduled", action="store_true",
+                    help="executa uma vez as tarefas locais vencidas e sai")
     ap.add_argument("--auto-mode", dest="auto_mode", action="store_true",
                     help="liga o modo automático (o SEND escolhe "
                          "chat/coding/plan/workflow sozinho)")
@@ -7196,7 +7519,7 @@ def main(argv=None):
     if args.update:
         return self_update(c)
 
-    cfg = load_config()
+    cfg = apply_project_permissions(load_config())
     if not args.base_url and not args.doctor and not args.models:
         first_run_setup(cfg, c)
     if args.base_url:
@@ -7226,6 +7549,15 @@ def main(argv=None):
         mode_explicit = "chat"
     if args.auto_mode is not None:
         cfg["auto_mode"] = args.auto_mode
+    if args.max_turns is not None:
+        if args.max_turns < 1:
+            ap_error = "--max-turns deve ser maior que zero"
+            if args.output_format == "text":
+                print(f"✗ {ap_error}", file=sys.stderr)
+            else:
+                print(json.dumps({"type": "result", "status": "error",
+                                  "exit_code": 2, "error": ap_error}, ensure_ascii=False))
+            return 2
 
     if args.models:
         try:
@@ -7251,6 +7583,8 @@ def main(argv=None):
         return doctor(cfg, c)
 
     sess = Session(cfg, c)
+    if args.max_turns is not None:
+        sess.max_turns = args.max_turns
     # auto-detecta o backend (LM Studio → Ollama) antes da 1ª chamada
     if args.base_url is None:
         cfg["base_url"] = detect_backend(cfg, c)
@@ -7278,6 +7612,9 @@ def main(argv=None):
 
     # -y vale só para esta sessão (não vai para a config salva)
     sess.auto_confirm = bool(args.yes) or bool(cfg["auto_confirm"])
+
+    if args.run_scheduled:
+        return run_due_schedules(cfg, c, sess.model_id)
 
     # --continue / -C: retoma a conversa salva mais recente (grátis)
     if getattr(args, "cont", False):
@@ -7315,8 +7652,23 @@ def main(argv=None):
         prompt = sys.stdin.read()
 
     if prompt:
+        if args.print_mode or args.output_format != "text":
+            return automation_one_shot(
+                sess, prompt, tools_enabled,
+                getattr(sess, "auto_confirm", cfg["auto_confirm"]),
+                args.output_format,
+            )
         return one_shot(sess, prompt, c, tools_enabled,
                         getattr(sess, "auto_confirm", cfg["auto_confirm"]))
+
+    if args.print_mode or args.output_format != "text":
+        message = "--print requer um prompt ou conteúdo no stdin"
+        if args.output_format == "text":
+            print(f"✗ {message}", file=sys.stderr)
+        else:
+            print(json.dumps({"type": "result", "status": "error",
+                              "exit_code": 2, "error": message}, ensure_ascii=False))
+        return 2
 
     return repl(sess, c, tools_enabled)
 
@@ -7331,108 +7683,428 @@ APP_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>⚡ SEND App</title>
+<title>SEND — Claude Edition</title>
 <style>
+/* ── Claude Design Tokens (pixel-perfect) ── */
 :root{
-  --bg:#0b0e14;--bg2:#11151f;--bg3:#161b28;--border:#232a3a;
-  --text:#e2e8f0;--dim:#7c8aa5;--accent:#38bdf8;--accent2:#c084fc;
-  --ok:#34d399;--warn:#fbbf24;--err:#f87171;--userbg:#1e293b;
+  --canvas:#faf9f5;
+  --parchment:#f5f4ed;
+  --surface:#ffffff;
+  --surface-soft:#f5f0e8;
+  --surface-warm:#efe9de;
+  --surface-card:#ffffff;
+  --ink:#141413;
+  --body:#3d3d3a;
+  --muted:#6c6a64;
+  --muted-soft:#8e8b82;
+  --muted-warm:#5e5d59;
+  --stone:#87867f;
+  --hairline:#e6dfd8;
+  --hairline-soft:#f0eee6;
+  --border-warm:#e8e6dc;
+  --warm-sand:#e8e6dc;
+  --accent:#c96442;
+  --accent-hover:#a9583e;
+  --accent-coral:#d97757;
+  --accent-terra:#cc785c;
+  --dark:#141413;
+  --dark-surface:#181715;
+  --dark-elevated:#252320;
+  --focus:#3898ec;
+  --success:#5db872;
+  --radius-sm:8px;
+  --radius-md:12px;
+  --radius-lg:16px;
+  --radius-xl:24px;
+  --radius-pill:9999px;
 }
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
-#sidebar{width:280px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;transition:margin .3s}
-#sidebar.hidden{margin-left:-280px}
-.sidebar-header{padding:16px;border-bottom:1px solid var(--border)}
-.sidebar-header h3{font-size:13px;text-transform:uppercase;letter-spacing:.5px;color:var(--accent)}
-.sidebar-section{flex:1;overflow-y:auto;padding:8px}
+html,body{height:100%}
+body{
+  font-family:"Anthropic Sans","Inter","Geist",ui-sans-system,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+  background:var(--canvas);
+  color:var(--ink);
+  height:100vh;display:flex;overflow:hidden;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  line-height:1.6;
+}
+/* Serif for display */
+h1,h2,h3,.serif{font-family:"Anthropic Serif","Cormorant Garamond",Georgia,serif}
+
+/* ── Sidebar — Claude style ── */
+#sidebar{
+  width:260px;min-width:260px;
+  background:var(--surface-soft);
+  border-right:1px solid var(--hairline-soft);
+  display:flex;flex-direction:column;
+  transition:margin .25s cubic-bezier(.4,0,.2,1);
+}
+#sidebar.hidden{margin-left:-260px}
+.sidebar-top{padding:14px 14px 10px;display:flex;flex-direction:column;gap:10px}
+.brand{ display:flex;align-items:center;gap:10px;padding:6px 4px}
+.brand-mark{
+  width:28px;height:28px;border-radius:8px;
+  background:var(--accent);color:#fff;
+  display:flex;align-items:center;justify-content:center;
+  font-family:"Anthropic Serif",Georgia,serif;font-weight:600;font-size:16px;line-height:1;
+  flex-shrink:0;
+}
+.brand-name{font-family:"Anthropic Serif",Georgia,serif;font-size:18px;font-weight:500;letter-spacing:-.02em;color:var(--ink)}
+.brand-sub{font-size:11px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase;margin-left:auto}
+.btn-new{
+  display:flex;align-items:center;justify-content:center;gap:8px;
+  width:100%;height:40px;
+  background:var(--accent);color:var(--canvas);
+  border:1px solid var(--accent);border-radius:12px;
+  font-size:14px;font-weight:500;font-family:inherit;cursor:pointer;
+  box-shadow:0 0 0 1px var(--accent);
+  transition:background .15s,transform .1s;
+}
+.btn-new:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn-new:active{transform:scale(.98)}
+.btn-new svg{width:16px;height:16px}
+
+.sidebar-section{flex:1;overflow-y:auto;padding:8px 10px 16px}
 .sidebar-section::-webkit-scrollbar{width:6px}
-.sidebar-section::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
-.sec-title{font-size:11px;text-transform:uppercase;color:var(--dim);padding:12px 8px 4px;letter-spacing:.5px}
-.sk-item{display:flex;align-items:center;gap:10px;padding:8px 10px;margin:2px 0;border-radius:8px;cursor:pointer;font-size:13px}
-.sk-item:hover{background:var(--bg3)}
-.sk-item .ico{font-size:16px;width:22px;text-align:center}
-.sk-item small{color:var(--dim);display:block;font-size:11px}
-.main{flex:1;display:flex;flex-direction:column;min-width:0}
-header{background:var(--bg2);border-bottom:1px solid var(--border);padding:10px 18px;display:flex;align-items:center;gap:14px}
-#menu-btn{background:none;border:none;color:var(--text);font-size:20px;cursor:pointer;padding:4px 8px;border-radius:6px}
-#menu-btn:hover{background:var(--bg3)}
-header h1{font-size:16px;background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700}
-.chips{display:flex;gap:8px;margin-left:auto;flex-wrap:wrap}
-.chip{font-size:11px;padding:4px 10px;border-radius:20px;background:var(--bg3);border:1px solid var(--border);color:var(--dim)}
-.chip b{color:var(--accent)}
-.chip.mode-coding b{color:var(--accent)}.chip.mode-chat b{color:#60a5fa}.chip.mode-plan b{color:var(--accent2)}.chip.mode-workflow b{color:#f472b6}
-#chat{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:16px}
-#chat::-webkit-scrollbar{width:8px}#chat::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
-.msg{max-width:85%;padding:14px 18px;border-radius:16px;line-height:1.6;font-size:14px;white-space:pre-wrap;word-wrap:break-word}
-.msg.user{align-self:flex-end;background:linear-gradient(135deg,#1e40af,#3b82f6);border-bottom-right-radius:4px}
-.msg.assistant{align-self:flex-start;background:var(--bg3);border:1px solid var(--border);border-bottom-left-radius:4px}
-.msg.system{align-self:center;background:transparent;color:var(--dim);font-size:12px;padding:4px}
-.msg pre{background:#0d1117;border:1px solid var(--border);border-radius:10px;padding:14px;margin:10px 0;overflow-x:auto;font-family:'Consolas','Monaco',monospace;font-size:13px}
-.msg code{background:#0d1117;padding:2px 7px;border-radius:5px;font-family:monospace;font-size:90%;color:var(--accent)}
-.tool-call{background:#0d1520;border-left:3px solid var(--accent);padding:8px 12px;margin:8px 0;border-radius:0 8px 8px 0;font-size:12px;color:var(--dim)}
-.typing{display:inline-flex;gap:4px;padding:12px 18px}
-.typing span{width:8px;height:8px;background:var(--dim);border-radius:50%;animation:bounce 1.2s infinite}
-.typing span:nth-child(2){animation-delay:.15s}.typing span:nth-child(3){animation-delay:.3s}
-@keyframes bounce{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-8px)}}
-.input-wrap{padding:14px 20px;background:var(--bg2);border-top:1px solid var(--border)}
-.autocomplete{position:absolute;bottom:100%;left:0;right:0;background:var(--bg3);border:1px solid var(--border);border-radius:12px;max-height:260px;overflow-y:auto;display:none;margin-bottom:8px;box-shadow:0 -8px 24px rgba(0,0,0,.4)}
+.sidebar-section::-webkit-scrollbar-thumb{background:var(--hairline);border-radius:3px}
+.sec-title{
+  font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);padding:14px 8px 6px;
+}
+.sk-item{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 10px;margin:2px 0;border-radius:10px;cursor:pointer;
+  font-size:13.5px;line-height:1.25;color:var(--body);
+  border:1px solid transparent;
+  transition:background .12s,border-color .12s;
+}
+.sk-item:hover{background:var(--surface);border-color:var(--hairline-soft);box-shadow:0 1px 6px rgba(0,0,0,.04)}
+.sk-item .ico{font-size:15px;width:22px;text-align:center;flex-shrink:0;opacity:.9}
+.sk-item small{color:var(--muted-soft);display:block;font-size:11.5px;line-height:1.2;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sk-item .info{flex:1;min-width:0}
+
+.sidebar-bottom{
+  padding:12px;border-top:1px solid var(--hairline-soft);
+  background:var(--surface-soft);
+}
+.model-chip{
+  display:flex;align-items:center;gap:8px;
+  background:var(--surface);border:1px solid var(--hairline);
+  border-radius:12px;padding:8px 10px;font-size:12px;color:var(--muted);
+}
+.model-dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 0 3px rgba(93,184,114,.18)}
+.model-chip b{color:var(--ink);font-weight:600}
+
+/* ── Main ── */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--canvas)}
+header{
+  height:52px;min-height:52px;
+  background:var(--canvas);
+  border-bottom:1px solid var(--hairline-soft);
+  padding:0 16px;display:flex;align-items:center;gap:12px;
+  position:sticky;top:0;z-index:5;
+}
+#menu-btn{
+  width:32px;height:32px;display:flex;align-items:center;justify-content:center;
+  background:transparent;border:1px solid transparent;color:var(--muted);
+  font-size:18px;cursor:pointer;border-radius:8px;transition:all .15s;
+}
+#menu-btn:hover{background:var(--surface);border-color:var(--hairline);color:var(--ink)}
+header h1{
+  font-family:"Anthropic Serif",Georgia,serif;
+  font-size:15px;font-weight:500;letter-spacing:-.02em;color:var(--ink);
+  display:flex;align-items:center;gap:8px;
+}
+header h1 .dot{color:var(--accent-coral);font-size:18px;line-height:1}
+.header-center{ flex:1; display:flex; justify-content:center; }
+/* ── Mode switcher (Claude Cowork style segmented control) ── */
+.mode-switch{
+  display:inline-flex;align-items:center;
+  background:var(--warm-sand);
+  border:1px solid var(--hairline);
+  border-radius:9999px;padding:3px;gap:2px;
+}
+.mode-btn{
+  padding:6px 14px;border-radius:9999px;
+  font-size:13px;font-weight:500;line-height:1;
+  color:var(--muted);background:transparent;border:1px solid transparent;
+  cursor:pointer;transition:all .16s;white-space:nowrap;
+  display:flex;align-items:center;gap:6px;
+}
+.mode-btn:hover{color:var(--ink)}
+.mode-btn.active{
+  background:var(--surface);color:var(--ink);
+  border-color:var(--hairline);box-shadow:0 1px 6px rgba(0,0,0,.06);
+}
+.mode-btn .ico{font-size:13px}
+.chips{display:flex;gap:8px;margin-left:auto;align-items:center}
+.chip{
+  font-size:11px;padding:5px 10px;border-radius:9999px;
+  background:var(--surface);border:1px solid var(--hairline);
+  color:var(--muted);
+}
+.chip b{color:var(--ink);font-weight:600}
+.chip.mode-coding b{color:var(--accent)}
+.chip.mode-chat b{color:var(--ink)}
+.chip.mode-plan b{color:#8b5cf6}
+.chip.mode-workflow b{color:var(--accent-coral)}
+
+/* ── Chat column ── */
+#chat{
+  flex:1;overflow-y:auto;
+  padding:28px 20px 16px;
+  display:flex;flex-direction:column;gap:18px;
+  scroll-behavior:smooth;
+}
+#chat::-webkit-scrollbar{width:8px}
+#chat::-webkit-scrollbar-thumb{background:var(--hairline);border-radius:4px}
+#chat-inner{
+  width:100%;max-width:760px;margin:0 auto;
+  display:flex;flex-direction:column;gap:18px;
+}
+.welcome{
+  text-align:center;padding:48px 24px 20px;
+}
+.welcome h2{
+  font-family:"Anthropic Serif",Georgia,serif;
+  font-size:32px;font-weight:400;letter-spacing:-.03em;line-height:1.15;
+  color:var(--ink);margin-bottom:10px;
+}
+.welcome p{color:var(--muted);font-size:14.5px;max-width:560px;margin:0 auto 18px}
+.welcome-ctas{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.welcome-cta{
+  padding:8px 14px;border-radius:9999px;
+  background:var(--surface);border:1px solid var(--hairline);
+  font-size:13px;color:var(--body);cursor:pointer;transition:all .15s;
+}
+.welcome-cta:hover{border-color:var(--accent);color:var(--accent)}
+
+/* Messages */
+.msg{
+  max-width:100%;line-height:1.65;font-size:14.5px;
+  white-space:pre-wrap;word-wrap:break-word;overflow-wrap:anywhere;
+}
+.msg.user{
+  align-self:flex-end;
+  max-width:78%;
+  background:var(--surface);
+  border:1px solid var(--hairline);
+  border-radius:18px;
+  padding:12px 16px;
+  box-shadow:0 1px 8px rgba(0,0,0,.04);
+  color:var(--ink);
+}
+.msg.assistant{
+  align-self:flex-start;
+  width:100%;
+  background:transparent;
+  border:none;
+  padding:2px 4px;
+  color:var(--ink);
+}
+.msg.system{
+  align-self:center;
+  background:var(--surface-soft);
+  border:1px solid var(--hairline-soft);
+  color:var(--muted);font-size:12.5px;padding:6px 12px;border-radius:9999px;
+}
+.msg .role-label{
+  font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted-soft);margin-bottom:6px;
+}
+.msg pre{
+  background:var(--dark-surface);
+  border:1px solid #252320;
+  border-radius:12px;padding:0;margin:12px 0;overflow:hidden;
+  box-shadow:0 4px 24px rgba(0,0,0,.12);
+}
+.msg pre code{
+  display:block;padding:14px 16px;overflow-x:auto;
+  font-family:"Anthropic Mono",ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
+  font-size:13px;line-height:1.6;color:#e8e6dc;background:transparent;white-space:pre;
+}
+.code-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:8px 12px;background:var(--dark-elevated);
+  border-bottom:1px solid #2a2a28;font-size:12px;color:var(--muted-soft);
+}
+.code-lang{
+  font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;
+  color:#a09d96;background:#1f1e1b;border:1px solid #2a2a28;
+  padding:3px 8px;border-radius:9999px;
+}
+.code-copy{
+  background:var(--surface);border:1px solid var(--hairline);
+  color:var(--ink);font-size:11px;font-weight:500;
+  padding:4px 8px;border-radius:8px;cursor:pointer;
+}
+.msg code:not(pre code){
+  background:var(--surface-soft);
+  border:1px solid var(--hairline-soft);
+  padding:2px 6px;border-radius:6px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;color:var(--ink);
+}
+.tool-call{
+  background:var(--surface);border:1px solid var(--hairline);
+  border-left:3px solid var(--accent);
+  padding:10px 12px;margin:10px 0;border-radius:0 12px 12px 0;
+  font-size:13px;color:var(--muted);font-family:ui-monospace,monospace;
+}
+
+.typing{display:inline-flex;gap:4px;padding:10px 2px}
+.typing span{width:7px;height:7px;background:var(--hairline);border:1px solid var(--border-warm);border-radius:50%;animation:bounce 1.2s infinite}
+.typing span:nth-child(2){animation-delay:.15s}
+.typing span:nth-child(3){animation-delay:.3s}
+@keyframes bounce{0%,60%,100%{transform:translateY(0);opacity:.6}30%{transform:translateY(-6px);opacity:1}}
+
+/* ── Input — Claude style ── */
+.input-wrap{
+  padding:12px 16px 14px;
+  background:linear-gradient(to top, var(--canvas) 85%, transparent);
+  border-top:1px solid transparent;
+}
+.input-shell{
+  width:100%;max-width:760px;margin:0 auto;
+  position:relative;
+}
+.autocomplete{
+  position:absolute;bottom:100%;left:0;right:0;
+  background:var(--surface);border:1px solid var(--hairline);
+  border-radius:16px;max-height:280px;overflow-y:auto;display:none;
+  margin-bottom:10px;box-shadow:0 8px 32px rgba(0,0,0,.08);
+}
 .autocomplete.show{display:block}
-.ac-head{padding:8px 14px;font-size:11px;color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--border)}
-.ac-item{padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid #1a2030}
+.ac-head{padding:10px 14px;font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--muted);text-transform:uppercase;border-bottom:1px solid var(--hairline-soft)}
+.ac-item{padding:10px 14px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--hairline-soft)}
 .ac-item:last-child{border:none}
-.ac-item:hover,.ac-item.sel{background:#1e293b}
-.ac-item b{color:var(--accent);font-weight:600}
-.ac-item small{color:var(--dim);margin-left:auto;padding-left:12px;font-size:11px;text-align:right}
-.input-row{display:flex;gap:10px;position:relative;align-items:flex-end}
-#input{flex:1;background:var(--bg);border:2px solid var(--border);color:var(--text);padding:14px 18px;border-radius:14px;font-size:14px;outline:none;resize:none;transition:border .2s}
-#input:focus{border-color:var(--accent)}
-#send-btn{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;color:#fff;width:48px;height:48px;border-radius:14px;cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;transition:transform .15s}
-#send-btn:hover{transform:scale(1.08)}
-#send-btn:disabled{opacity:.5;cursor:wait}
-.quick-row{display:flex;gap:6px;padding:0 20px 8px;flex-wrap:wrap}
-.quick{font-size:11px;padding:5px 12px;border-radius:16px;background:var(--bg3);border:1px solid var(--border);color:var(--dim);cursor:pointer;transition:all .15s}
-.quick:hover{border-color:var(--accent);color:var(--accent)}
+.ac-item:hover,.ac-item.sel{background:var(--surface-soft)}
+.ac-item b{color:var(--ink);font-weight:600;font-size:13px}
+.ac-item small{color:var(--muted);margin-left:auto;padding-left:12px;font-size:12px;text-align:right}
+
+.input-row{
+  display:flex;gap:10px;align-items:flex-end;
+  background:var(--surface);
+  border:1px solid var(--hairline);
+  border-radius:24px;
+  padding:8px 8px 8px 16px;
+  box-shadow:0 1px 8px rgba(0,0,0,.04), 0 4px 24px rgba(0,0,0,.04);
+  transition:border-color .15s,box-shadow .15s;
+}
+.input-row:focus-within{border-color:var(--focus);box-shadow:0 0 0 3px rgba(56,152,236,.15), 0 4px 24px rgba(0,0,0,.06)}
+#input{
+  flex:1;background:transparent;border:none;color:var(--ink);
+  font-size:15px;line-height:1.5;outline:none;resize:none;max-height:140px;
+  font-family:inherit;padding:8px 0;
+}
+#input::placeholder{color:var(--stone)}
+#send-btn{
+  width:36px;height:36px;flex-shrink:0;
+  background:var(--accent);border:1px solid var(--accent);
+  color:#fff;border-radius:50%;cursor:pointer;
+  font-size:15px;display:flex;align-items:center;justify-content:center;
+  transition:background .15s,transform .12s,opacity .15s;
+  box-shadow:0 1px 4px rgba(201,100,66,.35);
+}
+#send-btn:hover{background:var(--accent-hover);transform:scale(1.04)}
+#send-btn:active{transform:scale(.96)}
+#send-btn:disabled{opacity:.5;cursor:wait;transform:none}
+.quick-row{max-width:760px;margin:0 auto;display:flex;gap:7px;padding:8px 2px 0;flex-wrap:wrap}
+.quick{
+  font-size:12.5px;padding:6px 12px;border-radius:9999px;
+  background:var(--surface);border:1px solid var(--hairline);
+  color:var(--muted);cursor:pointer;transition:all .15s;
+}
+.quick:hover{border-color:var(--accent);color:var(--accent);background:var(--canvas)}
+.footer-note{
+  text-align:center;font-size:11px;color:var(--stone);padding:8px 0 2px;
+}
+
+/* Mobile */
+@media(max-width:860px){
+  #sidebar{position:fixed;left:0;top:0;bottom:0;z-index:20;box-shadow:4px 0 24px rgba(0,0,0,.12)}
+  #sidebar.hidden{margin-left:-260px;box-shadow:none}
+  header .header-center{display:none}
+  .msg.user{max-width:88%}
+}
 </style>
 </head>
 <body>
 <div id="sidebar">
-  <div class="sidebar-header"><h3>⚡ SEND</h3></div>
+  <div class="sidebar-top">
+    <div class="brand">
+      <div class="brand-mark">*</div>
+      <div class="brand-name">SEND</div>
+      <div class="brand-sub">Claude Edition</div>
+    </div>
+    <button class="btn-new" onclick="newChat()">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 3v10M3 8h10"/></svg>
+      Novo chat
+    </button>
+  </div>
   <div class="sidebar-section">
-    <div class="sec-title">⚡ Comandos</div><div id="cmds"></div>
-    <div class="sec-title">🧰 Skills</div><div id="skills"></div>
-    <div class="sec-title">🔌 Providers</div><div id="providers"></div>
+    <div class="sec-title">Comandos</div><div id="cmds"></div>
+    <div class="sec-title">Skills</div><div id="skills"></div>
+    <div class="sec-title">Providers</div><div id="providers"></div>
+  </div>
+  <div class="sidebar-bottom">
+    <div class="model-chip"><span class="model-dot"></span><span id="model-chip-text">carregando…</span></div>
   </div>
 </div>
 <div class="main">
   <header>
-    <button id="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('hidden')">☰</button>
-    <h1>SEND App</h1>
+    <button id="menu-btn" onclick="document.getElementById('sidebar').classList.toggle('hidden')" title="Alternar barra lateral">☰</button>
+    <h1><span class="dot">✦</span> SEND <span style="font-weight:400;color:var(--muted);font-family:Inter,sans-serif;font-size:13px">· Claude Edition</span></h1>
+    <div class="header-center">
+      <div class="mode-switch" id="mode-switch">
+        <button class="mode-btn" data-mode="chat" onclick="setMode('chat')"><span class="ico">💬</span> Chat</button>
+        <button class="mode-btn" data-mode="cowork" onclick="setMode('cowork')"><span class="ico">🤝</span> Cowork</button>
+        <button class="mode-btn active" data-mode="code" onclick="setMode('code')"><span class="ico">🛠</span> Code</button>
+      </div>
+    </div>
     <div class="chips" id="chips"></div>
   </header>
-  <div id="chat"></div>
-  <div class="quick-row" id="quick"></div>
-  <div class="input-wrap">
-    <div style="position:relative">
-      <div id="autocomplete" class="autocomplete"><div class="ac-head">Comandos — ↑↓ navega · Tab completa · Enter envia</div><div id="ac-list"></div></div>
-      <div class="input-row">
-        <textarea id="input" rows="1" placeholder="Mensagem ou / comando... (Ctrl+R histórico)"></textarea>
-        <button id="send-btn" onclick="sendMessage()">➤</button>
+  <div id="chat"><div id="chat-inner">
+    <div class="welcome" id="welcome">
+      <h2>Onde devemos começar?</h2>
+      <p>Escolha um modo acima — <b style="color:var(--ink)">Chat</b> para conversar, <b style="color:var(--ink)">Cowork</b> para planejar junto, <b style="color:var(--ink)">Code</b> para construir. Tudo com as cores e tipografia do Claude.</p>
+      <div class="welcome-ctas">
+        <span class="welcome-cta" onclick="useCmd('/help')">/help — ver comandos</span>
+        <span class="welcome-cta" onclick="useCmd('/doctor')">/doctor — checar conexão</span>
+        <span class="welcome-cta" onclick="useCmd('/skills')">/skills</span>
       </div>
+    </div>
+  </div></div>
+  <div class="input-wrap">
+    <div class="input-shell">
+      <div id="autocomplete" class="autocomplete"><div class="ac-head">Comandos — ↑↓ navega · Tab completa · Enter envia · Esc fecha</div><div id="ac-list"></div></div>
+      <div class="input-row">
+        <textarea id="input" rows="1" placeholder="Pergunte, planeje ou peça para codar... ( / para comandos )"></textarea>
+        <button id="send-btn" onclick="sendMessage()" title="Enviar">↑</button>
+      </div>
+      <div class="quick-row" id="quick"></div>
+      <div class="footer-note">SEND pode cometer erros. Verifique respostas importantes. · <span id="footer-model"></span></div>
     </div>
   </div>
 </div>
 <script>
-const input=document.getElementById('input'),chat=document.getElementById('chat'),
+const input=document.getElementById('input'),chatInner=document.getElementById('chat-inner'),chat=document.getElementById('chat'),
       acEl=document.getElementById('autocomplete'),acList=document.getElementById('ac-list');
-let commands=[],skills=[],providers=[],selIdx=0,curMatches=[],busy=false,hist=[],histPos=-1;
+let commands=[],skills=[],providers=[],selIdx=0,curMatches=[],busy=false,hist=[],histPos=-1,currentMode='code';
 
 function api(path,body){
   return fetch(path,{method:body?'POST':'GET',headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined}).then(r=>r.json());
 }
 function refresh(){
   api('/api/status').then(d=>{
-    document.getElementById('chips').innerHTML=
-      `<span class="chip mode-${d.mode}">${d.provider.split('(')[0].trim()} · <b>${d.model}</b> · ${d.mode}</span>`;
+    const prov=(d.provider||'').split('(')[0].trim();
+    const model=d.model||'auto';
+    const mode=(d.mode||currentMode);
+    document.getElementById('chips').innerHTML=`<span class="chip">`+prov+` · <b>`+model+`</b> · `+mode+`</span>`;
+    document.getElementById('model-chip-text').textContent=prov+' · '+model;
+    document.getElementById('footer-model').textContent=model+' · '+mode;
+    // sync switch
+    let m=mode==='coding'?'code':mode==='plan'?'cowork':mode==='workflow'?'cowork':mode;
+    if(['chat','code','cowork'].includes(m)) { currentMode=m; syncModeUI(); }
   }).catch(()=>{});
   Promise.all([api('/api/commands'),api('/api/skills'),api('/api/providers')]).then(([cm,sk,pr])=>{
     if(Array.isArray(cm)) commands=cm.map(x=>({name:x.name||x[0],desc:x.desc||x[2]||''}));
@@ -7443,32 +8115,68 @@ function refresh(){
 }
 function renderSidebar(){
   document.getElementById('cmds').innerHTML=commands.slice(0,20).map(c=>
-    `<div class="sk-item" onclick="useCmd('${c.name}')"><span class="ico">⚡</span><div>${c.name}<small>${c.desc||''}</small></div></div>`).join('');
+    `<div class="sk-item" onclick="useCmd('${c.name}')"><span class="ico">✦</span><div class="info">${c.name}<small>${c.desc||''}</small></div></div>`).join('');
   const skIcons={arquivos:'📁',terminal:'💻',internet:'🌐',pc:'🖥️',git:'🌿',processos:'⚙️',memoria:'🧠',subagentes:'🤝'};
   document.getElementById('skills').innerHTML=(Array.isArray(skills)?skills:[]).map(s=>{
     const n=s.name||s.id||String(s), d=s.description||s.desc||s[1]||'';
-    return `<div class="sk-item" onclick="input.value='${n} '; input.focus()"><span class="ico">${skIcons[n]||'⭐'}</span><div>${n}<small>${d}</small></div></div>`;
+    return `<div class="sk-item" onclick="input.value='${n} '; input.focus()"><span class="ico">${skIcons[n]||'⭐'}</span><div class="info">${n}<small>${d}</small></div></div>`;
   }).join('') || '<div class="sk-item"><small>carregando…</small></div>';
   document.getElementById('providers').innerHTML=(Array.isArray(providers)?providers:[]).slice(0,10).map(p=>
-    `<div class="sk-item" onclick="useCmd('/provider ${p.id}')"><span class="ico">🔌</span><div>${p.id}<small>${p.name}</small></div></div>`).join('');
+    `<div class="sk-item" onclick="useCmd('/provider ${p.id}')"><span class="ico">●</span><div class="info">${p.id}<small>${p.name}</small></div></div>`).join('');
 }
 function useCmd(c){ input.value=c+' '; input.focus(); input.dispatchEvent(new Event('input')); }
+function syncModeUI(){
+  document.querySelectorAll('.mode-btn').forEach(b=> b.classList.toggle('active', b.dataset.mode===currentMode));
+}
+function setMode(m){
+  currentMode=m; syncModeUI();
+  const map={chat:'/chat', code:'/code', cowork:'/workflow'};
+  const cmd=map[m]||'/chat';
+  // fire and refresh status
+  api('/api/command',{command:cmd}).then(()=> refresh());
+  input.focus();
+}
+function newChat(){
+  // clear column but keep welcome if empty
+  chatInner.innerHTML=`<div class="welcome" id="welcome"><h2>Onde devemos começar?</h2><p>Escolha um modo acima — <b style="color:var(--ink)">Chat</b> para conversar, <b style="color:var(--ink)">Cowork</b> para planejar junto, <b style="color:var(--ink)">Code</b> para construir. Tudo com as cores e tipografia do Claude.</p><div class="welcome-ctas"><span class="welcome-cta" onclick="useCmd('/help')">/help — ver comandos</span><span class="welcome-cta" onclick="useCmd('/doctor')">/doctor — checar conexão</span><span class="welcome-cta" onclick="useCmd('/skills')">/skills</span></div></div>`;
+  api('/api/command',{command:'/clear'}).catch(()=>{});
+}
 refresh(); setInterval(refresh,15000);
 
-// quick actions
-const quick=[['🛠 /code','/code'],['💬 /chat','/chat'],['📋 /plan','/plan'],['🔁 /workflow','/workflow'],
-  ['🧠 /memoria','/memoria'],['👥 /team','/team '],['🌿 git','git status'],['🔍 buscar','/doctor']];
+// quick actions — Claude style
+const quick=[['🛠 Code','/code'],['💬 Chat','/chat'],['🤝 Cowork','/workflow'],['🧠 Memoria','/memoria'],['🌿 Git','git status'],['🔍 Doctor','/doctor']];
 document.getElementById('quick').innerHTML=quick.map(q=>`<span class="quick" onclick="useCmd('${q[1]}')">${q[0]}</span>`).join('');
 
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function formatAssistant(text){
+  let h=escapeHtml(text);
+  // code blocks ```lang\ncode``` -> dark card
+  h=h.replace(/```(\w*)\n([\s\S]*?)```/g,(m,lang,code)=>{
+    const l=(lang||'').trim()||'code';
+    const esc=code.replace(/`/g,'&#96;');
+    return `<pre><div class="code-head"><span class="code-lang">${l}</span><button class="code-copy" onclick="navigator.clipboard.writeText(decodeURIComponent('${encodeURIComponent(code)}'))">Copiar</button></div><code>${esc}</code></pre>`;
+  });
+  h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
+  // bold
+  h=h.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+  return h;
+}
 function addMsg(role,content,isHtml){
+  // hide welcome on first message
+  const wel=document.getElementById('welcome'); if(wel) wel.style.display='none';
+  const wrap=document.createElement('div'); wrap.style.display='flex'; wrap.style.flexDirection='column'; wrap.style.gap='6px';
+  // role label for assistant
+  if(role==='assistant'){
+    const label=document.createElement('div'); label.className='role-label'; label.textContent='SEND · Claude Edition';
+    wrap.appendChild(label);
+  }
   const div=document.createElement('div'); div.className='msg '+role;
   if(!isHtml){
-    let h=content.replace(/&/g,'&amp;').replace(/</g,'&lt;');
-    h=h.replace(/```(\w*)\n([\s\S]*?)```/g,(m,l,c)=>`<pre>${c}</pre>`);
-    h=h.replace(/`([^`]+)`/g,'<code>$1</code>');
-    div.innerHTML=h;
+    if(role==='assistant') div.innerHTML=formatAssistant(content);
+    else { div.textContent=content; }
   } else div.innerHTML=content;
-  chat.appendChild(div); chat.scrollTop=chat.scrollHeight; return div;
+  wrap.appendChild(div);
+  chatInner.appendChild(wrap); chat.scrollTop=chat.scrollHeight; return wrap;
 }
 
 function updateAC(matches){
@@ -7490,12 +8198,11 @@ function applyMatch(){
 }
 
 input.addEventListener('input',()=>{
-  input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,120)+'px';
+  input.style.height='auto'; input.style.height=Math.min(input.scrollHeight,140)+'px';
   const v=input.value;
   if(v.startsWith('/') && !v.includes('\n')){
     const q=v.toLowerCase();
     let matches=[];
-    // subcomandos: /provider x -> sugere modelos/providers
     const sp=v.split(/\s+/);
     if(sp.length>=2 && sp.length<=2 && v.endsWith(' ')===false && sp[1]){
       const sub=sp[sp.length-1].toLowerCase();
@@ -7504,7 +8211,6 @@ input.addEventListener('input',()=>{
     }
     if(!matches.length){
       matches=commands.filter(cmd=>cmd.name.toLowerCase().startsWith(q)|| (q.length>2&&cmd.desc&&cmd.desc.toLowerCase().includes(q)));
-      // também skills como comandos
       if(v==='/' ) matches=commands.concat(skills.map(s=>({name:s.name||s,desc:s.description||'skill'})));
     }
     selIdx=0; updateAC(matches);
@@ -7518,7 +8224,6 @@ input.addEventListener('keydown',e=>{
     else if(e.key==='Tab'){ e.preventDefault(); applyMatch(); }
     else if(e.key==='Escape'){ acEl.classList.remove('show'); }
   } else {
-    // histórico com setas
     if(e.key==='ArrowUp'&&!input.value){ if(histPos<hist.length-1){histPos++;input.value=hist[hist.length-1-histPos];} e.preventDefault(); }
     else if(e.key==='ArrowDown'&&histPos>=0){ histPos--; input.value=histPos>=0?hist[hist.length-1-histPos]:''; e.preventDefault(); }
   }
@@ -7531,7 +8236,7 @@ async function sendMessage(){
   addMsg('user',text); hist.push(text); histPos=-1;
   input.value=''; input.style.height='auto'; acEl.classList.remove('show');
   const typing=addMsg('assistant','',true);
-  typing.innerHTML='<span class="typing"><span></span><span></span><span></span></span>';
+  typing.lastChild.innerHTML='<span class="typing"><span></span><span></span><span></span></span>';
   try{
     if(text.startsWith('/')){
       const d=await api('/api/command',{command:text});

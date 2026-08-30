@@ -172,6 +172,57 @@ model gpt-5              # troca diretamente pelo ID
 - `/config command_deny ["git push.*"]` → bloqueia comandos que casarem com o regex.
 - `/config command_allow ["echo .*","ls .*"]` → se não-vazio, **só** esses comandos passam.
 
+### 🔐 Permissões por projeto
+
+Além da configuração global, cada projeto pode ter um `.send.json` na raiz,
+versionável no Git. Ele restringe as ferramentas e comandos daquele projeto;
+as regras locais nunca ampliam permissões globais e `deny` sempre vence.
+
+```json
+{
+  "tool_allow": ["read_*", "list_files", "git_*"],
+  "tool_deny": ["write_file", "delete_file", "mcp_*"],
+  "command_allow": ["git status", "git diff.*"],
+  "command_deny": ["git push.*"]
+}
+```
+
+Use `/permissions` para ver as regras globais e as carregadas do projeto atual.
+
+### ⚙️ Automação e CI/CD
+
+Use `--print` para obter somente a resposta, sem banner ou elementos da interface.
+Para integrações, `--output-format json` retorna um objeto parseável com status,
+resposta, modelo e número de turnos; `stream-json` retorna o mesmo objeto como
+um evento NDJSON final. `--max-turns` limita as iterações do agente.
+
+```bash
+send --print "explique este erro"
+send --output-format json --max-turns 3 "revise este projeto"
+send --print --output-format stream-json "liste riscos desta mudança"
+```
+
+### ⏰ Agendamentos e histórico pesquisável
+
+O SEND pode guardar tarefas recorrentes localmente. No terminal interativo:
+
+```text
+/agendar add 60 revise os testes e gere um resumo
+/agendar                         # lista as tarefas
+/buscar autenticação              # busca nas conversas anteriores
+```
+
+Para executar tarefas vencidas, use um cron ou timer do sistema:
+
+```bash
+send --run-scheduled
+# Exemplo de cron a cada 5 minutos:
+# */5 * * * * /caminho/para/send --run-scheduled >> ~/.send/scheduled.log 2>&1
+```
+
+Por segurança, tarefas agendadas respeitam as permissões globais e do
+`.send.json` do projeto; elas não ativam o `outmode` automaticamente.
+
 ### 🤖 /agentes — modelo por modo
 
 Defina qual modelo cada modo usa — o SEND troca **sozinho** quando você alterna `/code`, `/chat`, `/plan` ou liga thinking:

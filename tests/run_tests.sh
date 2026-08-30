@@ -49,10 +49,10 @@ echo "== 7. Tool call (read_file, -y) =="
 python3 send.py -y "leia o arquivo README.md e me diga o que ele contem" < /dev/null > /tmp/send_t7.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t7.log && echo "OK"
 
 echo "== 8. Tool call web_search =="
-python3 send.py -y "pesquise na internet" < /dev/null > /tmp/send_t8.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t8.log && echo "OK"
+python3 send.py --no-auto-mode -y "pesquise na internet" < /dev/null > /tmp/send_t8.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t8.log && echo "OK"
 
 echo "== 9. Tool call system_info =="
-python3 send.py -y "informacoes do pc" < /dev/null > /tmp/send_t9.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t9.log && echo "OK"
+python3 send.py --no-auto-mode -y "informacoes do pc" < /dev/null > /tmp/send_t9.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t9.log && echo "OK"
 
 echo "== 10. Tool call edit_file =="
 python3 send.py -y "edite o arquivo" < /dev/null > /tmp/send_t10.log 2>&1 && grep -q "Resultado da ferramenta" /tmp/send_t10.log && echo "OK"
@@ -98,8 +98,9 @@ import send
 cfg = send.load_config()
 cfg["skills"] = ["terminal"]
 payload_tools = [t for t in send.TOOLS if t.get("skill") in cfg["skills"]]
-assert [t["function"]["name"] for t in payload_tools] == ["run_command"]
-print("   payload com apenas run_command OK")
+names = [t["function"]["name"] for t in payload_tools]
+assert names == ["run_command", "run_python", "get_env", "set_env"], names
+print("   payload com apenas ferramentas de terminal OK")
 PY
 
 echo "== 16. Workflow (4 etapas) =="
@@ -471,6 +472,61 @@ grep -q "modelo simulado" /tmp/send_chat_test.log && echo "   chat OK"
 
 echo "== 36. Providers de nuvem, customizados e autocomplete =="
 python3 -m unittest tests/test_providers.py
+
+echo "== 37. Permissões por projeto =="
+python3 - <<'PY' && echo "OK"
+import json, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ".")
+import send
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    (root / ".send.json").write_text(json.dumps({
+        "tool_deny": ["write_*", "mcp_*"],
+        "tool_allow": ["read_*", "list_files"],
+        "command_allow": ["git status"],
+    }), encoding="utf-8")
+    cfg = send.apply_project_permissions(send.load_config(), root)
+    assert send.tool_permission_error("write_file", cfg)
+    assert send.tool_permission_error("mcp_test_run", cfg)
+    assert send.tool_permission_error("run_command", cfg)
+    assert send.tool_permission_error("read_file", cfg) is None
+    assert cfg["_project_permissions"]["command_allow"] == ["git status"]
+print("   regras locais bloqueiam ferramentas e comandos corretamente")
+PY
+
+echo "== 38. Saída para automação (JSON + max-turns) =="
+python3 send.py --output-format json --max-turns 1 "oi" > /tmp/send_json_test.log 2>&1
+python3 - <<'PY' && echo "OK"
+import json
+data = json.load(open("/tmp/send_json_test.log", encoding="utf-8"))
+assert data["type"] == "result" and data["status"] == "success", data
+assert "modelo simulado" in data["response"], data
+assert data["turns"] == 1, data
+print("   JSON limpo e limite de turnos OK")
+PY
+
+echo "== 39. Busca de histórico e agendamentos =="
+SEND_HOME=$(mktemp -d) python3 - <<'PY' && echo "OK"
+import os, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, ".")
+import send
+root = Path(os.environ["SEND_HOME"])
+send.SEND_HOME = root
+send.HISTORY_PATH = root / "history.jsonl"
+send.SCHEDULES_PATH = root / "schedules.json"
+send.SCHEDULE_LOG_PATH = root / "schedules.jsonl"
+send.save_history([{"role": "user", "content": "corrigir bug de autenticação"},
+                   {"role": "assistant", "content": "bug corrigido"}])
+assert len(send.search_history("autenticação")) == 1
+task = send.add_schedule(5, "revisar testes")
+assert task["enabled"] and not send.due_schedules()
+send.mark_schedule_run(task["id"], now=1000, result="ok")
+saved = send.load_schedules()[0]
+assert saved["last_run"] == 1000 and saved["next_run"] == 1300
+print("   busca e persistência de agendamento OK")
+PY
 
 echo
 if grep -qE "Traceback|AssertionError|^✗ " "$_TEST_LOG"; then
